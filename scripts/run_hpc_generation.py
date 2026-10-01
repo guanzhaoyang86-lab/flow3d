@@ -64,13 +64,46 @@ def check_resume(directory: Path, configuration: dict) -> None:
         raise ValueError("Dataset is already complete; use its manifest instead of regenerating")
 
 
+def train_after_generation(output: Path, storage_root: Path, epochs: int, record: Path) -> None:
+    """Reuse the allocated A100 only after generation and validation succeed."""
+    complete = json.loads((output / "COMPLETE.json").read_text(encoding="utf-8"))
+    manifest = output / "manifest.json"
+    if complete.get("status") != "completed" or not manifest.is_file():
+        raise ValueError("Follow-up training requires a completed dataset and manifest")
+    command = [
+        sys.executable, str(REPOSITORY / "scripts/run_hpc_diffusion.py"), "train",
+        "--manifest", str(manifest), "--storage-root", str(storage_root), "--device", "cuda",
+        "--", "--epochs", str(epochs), "--batch-size", "1", "--num-workers", "0",
+        "--num-particles", "2", "--seed", "31", "--save-every", "1",
+    ]
+    state = {"status": "running", "dataset": str(output), "training_epochs": epochs,
+             "command": command, "slurm_job_id": os.environ.get("SLURM_JOB_ID")}
+    started = time.monotonic()
+    write_json(record / "pipeline.json", state)
+    print(f"Data generation validated. Starting follow-up training: {epochs} epoch(s)", flush=True)
+    try:
+        run_logged(command, record)
+        state["status"] = "completed"
+    except BaseException as error:
+        state.update(status="failed", error=f"{type(error).__name__}: {error}")
+        raise
+    finally:
+        state["training_elapsed_seconds"] = time.monotonic() - started
+        write_json(record / "pipeline.json", state)
+    print(f"Pipeline completed: generation and training. Record: {record / 'pipeline.json'}", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("mode", choices=("pilot", "full"))
     parser.add_argument("--storage-root", type=Path, default=os.environ.get("FLOW3D_ROOT"))
     parser.add_argument("--upstream-repo", type=Path, default=os.environ.get("FLOW3D_UPSTREAM_REPO"))
     parser.add_argument("--resume", type=Path, help="An incomplete dataset directory from this mode")
+    parser.add_argument("--train-epochs", type=int, default=0,
+                        help="After successful generation, train in this allocation; 0 disables training")
     args = parser.parse_args()
+    if args.train_epochs < 0:
+        parser.error("--train-epochs must be nonnegative")
     job = os.environ.get("SLURM_JOB_ID")
     if not job:
         parser.error("Data generation requires a Slurm job; use scripts/submit.sh generate-pilot")
@@ -172,6 +205,8 @@ def main() -> None:
             write_json(record / "results.json", result)
         write_json(output / "COMPLETE.json", result)
         print(f"Completed. Manifest: {output / 'manifest.json'}", flush=True)
+    if args.train_epochs:
+        train_after_generation(output, args.storage_root.resolve(), args.train_epochs, record)
 
 
 if __name__ == "__main__":

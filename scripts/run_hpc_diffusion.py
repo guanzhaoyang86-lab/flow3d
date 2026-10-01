@@ -112,7 +112,7 @@ def main() -> None:
         if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
             parser.error("exactly one working CUDA GPU is required")
         if not str(args.storage_root.resolve()).startswith("/work/"):
-            parser.error("DeltaAI output storage must be under /work")
+            parser.error("HPC output storage must be under /work")
     elif job or args.mode != "smoke":
         parser.error("CPU execution is only for a local smoke test outside Slurm")
     os.environ.setdefault("OMP_NUM_THREADS", "1")

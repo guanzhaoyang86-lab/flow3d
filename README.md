@@ -7,8 +7,9 @@
 [DeltaAI 真实模型部署说明](docs/deltaai.md)：已配置 ARM/GH200、`biup-dtai-gh`、
 `ghx4` 和站点 PyTorch 2.10.0，通过 `diffusion-*` 作业连接根目录的真实科研模型。
 `project/src/` 的原始小模型仍作为独立工作流示例。
-数据尚未上传时，可使用 [Delta 生成数据、DeltaAI 训练](docs/delta-generation.md)：
-在 Delta 的 A100 上运行固定版本 Taichi 求解器，直接写入两系统共享的 `/work/hdd`。
+数据尚未上传时，可使用 [Delta 生成数据并自动训练](docs/delta-generation.md)：
+在 Delta 的 A100 上运行固定版本 Taichi 求解器，通过 `generate-full --train-epochs 1`
+在同一个 Slurm 作业内接着训练。数据写入共享的 `/work/hdd`，也可供 DeltaAI 使用。
 ACCESS 项目为 `PHY260443`，实际 Slurm 计费账户和存储路径须按站点分配配置。
 
 在 HPC 首次克隆整个仓库后，从 `project/` 运行工作流模板：

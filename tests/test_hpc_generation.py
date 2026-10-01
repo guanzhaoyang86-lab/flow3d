@@ -73,3 +73,44 @@ def test_interrupted_archive_write_preserves_previous_data(tmp_path, monkeypatch
     with np.load(output, allow_pickle=False) as archive:
         assert np.all(archive["flow_field"] == 2)
     assert not output.with_suffix(".npz.tmp").exists()
+
+
+def test_followup_training_rejects_incomplete_data(tmp_path, monkeypatch):
+    (tmp_path / "COMPLETE.json").write_text('{"status": "failed"}')
+    (tmp_path / "manifest.json").write_text("{}")
+    commands = []
+    monkeypatch.setattr(generation, "run_logged", lambda *args: commands.append(args))
+    with pytest.raises(ValueError, match="completed dataset"):
+        generation.train_after_generation(tmp_path, tmp_path, 1, tmp_path)
+    assert not commands
+    assert not (tmp_path / "pipeline.json").exists()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_followup_training_records_status_and_preserves_data(tmp_path, monkeypatch, fail):
+    marker = tmp_path / "COMPLETE.json"
+    marker.write_text('{"status": "completed"}')
+    (tmp_path / "manifest.json").write_text("{}")
+    commands = []
+
+    def run(command, record):
+        commands.append(command)
+        state = json.loads((record / "pipeline.json").read_text())
+        assert state["status"] == "running"
+        if fail:
+            raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(generation, "run_logged", run)
+    if fail:
+        with pytest.raises(subprocess.CalledProcessError):
+            generation.train_after_generation(tmp_path, tmp_path, 1, tmp_path)
+    else:
+        generation.train_after_generation(tmp_path, tmp_path, 1, tmp_path)
+    assert json.loads(marker.read_text())["status"] == "completed"
+    state = json.loads((tmp_path / "pipeline.json").read_text())
+    assert state["status"] == ("failed" if fail else "completed")
+    command = commands[0]
+    assert command[command.index("--manifest") + 1] == str(tmp_path / "manifest.json")
+    assert command[command.index("--epochs") + 1] == "1"
+    assert command[command.index("--device") + 1] == "cuda"
+    assert Path(command[1]).name == "run_hpc_diffusion.py"

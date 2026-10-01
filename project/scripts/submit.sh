@@ -25,6 +25,7 @@ if [[ "$template" = diffusion && "$FLOW3D_GPUS" != 1 ]]; then
 fi
 if [[ "$template" = generate ]]; then
     [[ "$FLOW3D_CLUSTER" = delta && "$FLOW3D_GPUS" = 1 ]] || flow3d_die '数据生成使用 Delta，且 FLOW3D_GPUS=1'
+    [[ "$(uname -m)" = x86_64 ]] || flow3d_die '当前主机不是 x86_64。请返回 Delta（dt-login...）提交数据生成；生成环境位于 Delta 自己的 HOME。'
     [[ -f "${FLOW3D_UPSTREAM_REPO:-}/Single_phase/LBM_3D_SinglePhase_Solver.py" ]] || flow3d_die '请先运行 setup_delta_generation.sh 准备上游求解器'
 fi
 command -v sbatch >/dev/null || flow3d_die '请在 NCSA 登录节点提交作业'

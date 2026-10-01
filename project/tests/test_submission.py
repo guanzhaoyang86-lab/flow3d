@@ -238,6 +238,15 @@ class SubmissionTests(unittest.TestCase):
         self.assertIn("FLOW3D_GPUS=1", result.stderr)
         self.assertFalse(self.capture.exists())
 
+    def test_generation_rejects_deltaai_before_solver_lookup(self) -> None:
+        self.env["FLOW3D_GPUS"] = "1"
+        self.write_script(self.root / "bin" / "uname", '#!/bin/bash\nprintf "aarch64\\n"\n')
+        result = self.submit(mode="generate-full", arguments=[])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("dt-login", result.stderr)
+        self.assertNotIn("setup_delta_generation.sh", result.stderr)
+        self.assertFalse(self.capture.exists())
+
     def test_network_failure_prevents_submission(self) -> None:
         self.env["MOCK_PULL_FAIL"] = "1"
         result = self.submit()

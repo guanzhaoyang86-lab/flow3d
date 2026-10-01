@@ -1,7 +1,8 @@
-# Delta 生成流场数据，DeltaAI 训练（中文）
+# Delta 生成流场数据并接着训练（中文）
 
 本流程适用于 zguan2 于 2026-10-01 确认的环境。代码在本地修改并经 GitHub 同步，
 数据生成和训练都通过 Slurm。数据直接写入 HPC，不依赖从国内上传约 455 MB 的数据包。
+可以让 Delta 同一个 A100 作业在生成完成后自动训练，也可单独在 DeltaAI 训练。
 
 | 用途 | 系统与架构 | Slurm 账户 | 分区 / GPU |
 | --- | --- | --- | --- |
@@ -14,6 +15,8 @@ ACCESS 项目编号仍是 `PHY260443`，实际 `--account` 使用表中的站点
 [NCSA 文档](https://docs.ncsa.illinois.edu/systems/deltaai/en/latest/user-guide/data-mgmt.html)
 确认 `/work/hdd` 和 `/work/nvme` 在 Delta、DeltaAI 间共享，但两个系统的 HOME 分开。
 已验证数据目录为 `/work/hdd/biup/zguan2/datasets`。环境和代码分别在各自系统 HOME 安装。
+如果提示符是 `gh-login...`，当前位于 DeltaAI，无法使用 Delta HOME 中已安装的
+生成环境。回到 `dt-login...` 的 Delta 窗口即可；不需要在 DeltaAI 重装求解器。
 
 ## 1. 在 Delta 登录节点下载代码、准备独立环境
 
@@ -101,16 +104,22 @@ tail -n 100 /work/hdd/biup/$USER/logs/JOB_ID.err
     results.json
 ```
 
-## 3. 验证成功后，生成 1000 个样本
+## 3. 验证成功后，生成 1000 个样本并自动训练
 
 ```bash
 cd ~/projects/project_code/project
 source configs/delta-generation.env.example
 export FLOW3D_TIME=48:00:00
-bash scripts/submit.sh generate-full
+bash scripts/submit.sh generate-full --train-epochs 1
 ```
 
-这是最长时限，不是预计耗时；先用 pilot 的实际耗时估算。作业成功提交后，关闭 SSH
+同一 Slurm 作业会顺序完成：1000 个真实样本生成 → 数据校验和划分 → A100 上训练 1 个 epoch。
+训练使用刚生成的 manifest，batch size 1、每个样本抽取 2 个观测粒子、随机种子 31，
+其他参数沿用真实 diffusion 训练入口的默认值。160 是数据中保存的粒子数，2 是本轮模型输入粒子数。
+首轮 1 epoch 用于验证完整数据链路；需要更多轮次时修改 `--train-epochs`。
+只生成数据则省略该参数。失败的数据生成不会进入训练，也不需要在作业中重新申请 GPU。
+
+48 小时是生成和训练合计的最长时限，不是预计耗时；先用 pilot 的实际耗时估算。作业成功提交后，关闭 SSH
 不影响 Slurm 继续执行。取消使用 `scancel JOB_ID`。
 每次全新提交生成独立目录，不覆盖已有数据。三个 pilot 样本使用独立随机计划，不拼入正式集。
 
@@ -125,6 +134,16 @@ bash scripts/submit.sh generate-full
 这批数据是新的服务器版本，不保证与本地数据包逐字节相同。
 生成通过只证明数据契约与流程检查通过；物理收敛和科研适用性仍需研究者评估。
 
+自动训练时，日志会先出现 `Data generation validated. Starting follow-up training`，
+最后出现 `Pipeline completed: generation and training`。还应确认 `sacct` 为 `COMPLETED / 0:0`。
+数据目录的 `COMPLETE.json` 只表示生成阶段完成，整个流程状态在
+`attempts/<作业号>_<标识>/pipeline.json`。
+训练的完整实验记录位于 `/work/hdd/biup/$USER/results/experiments/`，
+权重位于 `/work/hdd/biup/$USER/checkpoints/`，具体路径会打印在同一作业日志中。
+
+若生成成功但训练失败，数据仍然保留。可用 `diffusion-train --manifest 实际路径 -- ...`
+单独重试训练，无需重新生成 1000 个样本。
+
 ## 4. 超时或失败后的续跑
 
 先用 `sacct` 确认原作业已结束，检查失败原因。未生成 `COMPLETE.json` 的目录可在
@@ -133,7 +152,7 @@ bash scripts/submit.sh generate-full
 ```bash
 source configs/delta-generation.env.example
 export FLOW3D_TIME=48:00:00
-bash scripts/submit.sh generate-full --resume /work/hdd/biup/$USER/datasets/实际未完成目录
+bash scripts/submit.sh generate-full --resume /work/hdd/biup/$USER/datasets/实际未完成目录 --train-epochs 1
 ```
 
 pilot 续跑使用 `generate-pilot --resume ...`。
@@ -141,9 +160,9 @@ pilot 续跑使用 `generate-pilot --resume ...`。
 半个 NPZ。并发写同一目录会被文件锁拒绝。代码或依赖改变时应创建新集合。
 被强制终止时 `results.json` 可能停留在 running，实际作业状态以 `sacct` 为准。
 
-## 5. 在 DeltaAI 读取共享数据训练
+## 5. 可选：在 DeltaAI 读取共享数据训练
 
-完整生成成功后，记下日志结尾的 manifest 绝对路径。在 DeltaAI 的 SSH 终端执行：
+需要换到 GH200 训练时，记下成功生成的数据 manifest 绝对路径。在 DeltaAI 的 SSH 终端执行：
 
 ```bash
 cd ~/projects/project_code

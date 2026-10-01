@@ -91,8 +91,9 @@ tail -n 100 /work/hdd/biup/$USER/logs/JOB_ID.err
 ## 4. 正式数据与训练
 
 先准备服务器可读的 NPZ 数据和 manifest。数据、checkpoint 不放入 GitHub。
-当前采用 [Delta 生成数据、DeltaAI 训练](delta-generation.md)：数据直接生成到共享工作目录，
-代码仍只经 GitHub 同步，无需从本地上传数据。
+数据可按 [Delta 生成数据流程](delta-generation.md) 直接生成到共享工作目录，
+代码仍只经 GitHub 同步，无需从本地上传数据。该流程也支持在 Delta 的 A100 上自动接着训练；
+需要使用 GH200 时再按本页提交 DeltaAI 作业。
 不得直接引用 Windows 的 `D:\...` 路径；推荐 manifest 内使用相对该 manifest 的 POSIX 相对路径。
 科研 manifest 必须按物理流场分组划分 train/validation/test，不能复用小测试的重叠数据划分。
 
