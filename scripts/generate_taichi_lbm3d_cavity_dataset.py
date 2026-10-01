@@ -234,11 +234,14 @@ def _run_cavity(
     }
     ti.init(
         arch=architectures[args.backend],
+        enable_fallback=False,
         default_fp=ti.f32,
         kernel_profiler=False,
         print_ir=False,
         offline_cache=True,
     )
+    if ti.lang.impl.current_cfg().arch != architectures[args.backend]:
+        raise RuntimeError("Taichi selected a different backend; check TI_ARCH")
     solver_class = _load_solver_class(solver_directory)
 
     size = args.grid_size
@@ -635,7 +638,11 @@ def _save_npz(payload: dict[str, object], output: Path) -> None:
             raise TypeError(
                 f"unsupported payload type for {name}: {type(value).__name__}"
             )
-    np.savez_compressed(output, **serialized)
+    # A killed Slurm job must not leave a half-written .npz that prevents resume.
+    temporary = output.with_suffix(output.suffix + ".tmp")
+    with temporary.open("wb") as stream:
+        np.savez_compressed(stream, **serialized)
+    temporary.replace(output)
 
 
 def main() -> None:

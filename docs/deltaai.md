@@ -1,7 +1,7 @@
 # DeltaAI：真实 diffusion 模型的环境验证与作业提交
 
 本页针对 zguan2 已确认的分配（2026-10-01），从完整 `flow3d` 仓库执行。
-代码在本地开发，通过私有 GitHub 仓库同步。服务器仅负责 Slurm 计算。
+代码在本地开发，通过 GitHub 仓库同步；当前仓库公开，HTTPS 拉取不需要令牌。服务器仅负责 Slurm 计算。
 
 | 项目 | 已确认值 |
 | --- | --- |
@@ -91,7 +91,8 @@ tail -n 100 /work/hdd/biup/$USER/logs/JOB_ID.err
 ## 4. 正式数据与训练
 
 先准备服务器可读的 NPZ 数据和 manifest。数据、checkpoint 不放入 GitHub。
-在当前“只经 GitHub 同步代码”的约束下，正式数据如何在服务器生成或获得仍需单独确定。
+当前采用 [Delta 生成数据、DeltaAI 训练](delta-generation.md)：数据直接生成到共享工作目录，
+代码仍只经 GitHub 同步，无需从本地上传数据。
 不得直接引用 Windows 的 `D:\...` 路径；推荐 manifest 内使用相对该 manifest 的 POSIX 相对路径。
 科研 manifest 必须按物理流场分组划分 train/validation/test，不能复用小测试的重叠数据划分。
 

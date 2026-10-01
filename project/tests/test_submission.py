@@ -212,6 +212,32 @@ class SubmissionTests(unittest.TestCase):
         self.assertIn("FLOW3D_GPUS=1", result.stderr)
         self.assertFalse(self.capture.exists())
 
+    def test_generation_uses_frozen_entry_and_forwards_mode(self) -> None:
+        shutil.copytree(self.publisher / "scripts", self.publisher / "project" / "scripts")
+        (self.publisher / "scripts" / "run_hpc_generation.py").write_text("# generation fixture\n")
+        self.commit(self.publisher, "add generation entry")
+        self.git("push", cwd=self.publisher)
+        self.git("pull", "--ff-only", cwd=self.repo)
+        upstream = self.root / "upstream" / "Single_phase"
+        upstream.mkdir(parents=True)
+        (upstream / "LBM_3D_SinglePhase_Solver.py").write_text("# upstream fixture\n")
+        self.env["FLOW3D_UPSTREAM_REPO"] = posix_path(upstream.parent)
+        self.env["FLOW3D_GPUS"] = "1"
+        result = self.submit("project/scripts/submit.sh", "generate-pilot", [])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        args = self.capture.read_bytes().decode("utf-8").rstrip("\0").split("\0")
+        self.assertIn("--gpus-per-node=1", args)
+        self.assertTrue(args[-2].endswith("/scripts/generate.slurm"))
+        self.assertEqual(args[-1], "pilot")
+        snapshot = native_path(next(arg.split("=", 1)[1] for arg in args if arg.startswith("--chdir=")))
+        self.assertTrue((snapshot.parent / "scripts" / "run_hpc_generation.py").is_file())
+
+    def test_generation_rejects_multiple_gpus_before_submission(self) -> None:
+        result = self.submit(mode="generate-full", arguments=[])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FLOW3D_GPUS=1", result.stderr)
+        self.assertFalse(self.capture.exists())
+
     def test_network_failure_prevents_submission(self) -> None:
         self.env["MOCK_PULL_FAIL"] = "1"
         result = self.submit()

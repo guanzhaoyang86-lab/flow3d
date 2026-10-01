@@ -7,6 +7,8 @@
 [DeltaAI 真实模型部署说明](docs/deltaai.md)：已配置 ARM/GH200、`biup-dtai-gh`、
 `ghx4` 和站点 PyTorch 2.10.0，通过 `diffusion-*` 作业连接根目录的真实科研模型。
 `project/src/` 的原始小模型仍作为独立工作流示例。
+数据尚未上传时，可使用 [Delta 生成数据、DeltaAI 训练](docs/delta-generation.md)：
+在 Delta 的 A100 上运行固定版本 Taichi 求解器，直接写入两系统共享的 `/work/hdd`。
 ACCESS 项目为 `PHY260443`，实际 Slurm 计费账户和存储路径须按站点分配配置。
 
 在 HPC 首次克隆整个仓库后，从 `project/` 运行工作流模板：
@@ -20,7 +22,7 @@ source configs/deltaai.env.example
 bash scripts/submit.sh diffusion-smoke
 ```
 
-仓库为私有，需要在 HPC 配置 GitHub 访问权限。提交脚本会同步整个仓库并保存固定
+仓库已公开，HPC 使用 HTTPS 克隆和拉取无需 GitHub 令牌。提交脚本会同步整个仓库并保存固定
 提交的源码快照，支持 `project/` 子目录布局。`diffusion-smoke` 使用微型合成数据运行
 真实训练和推理；`diffusion-train` / `diffusion-inference` 接受服务器上已有的数据。
 首次正式训练前必须通过真实 Slurm GPU 小测试；本地 CPU 验证不能替代这一步。

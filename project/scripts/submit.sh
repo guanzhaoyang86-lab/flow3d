@@ -10,7 +10,11 @@ case "$mode" in
         template=diffusion
         run_args=("${mode#diffusion-}" "$@")
         ;;
-    *) flow3d_die '用法: bash scripts/submit.sh train|inference|diffusion-smoke|diffusion-train|diffusion-inference [Python 参数]' ;;
+    generate-pilot|generate-full)
+        template=generate
+        run_args=("${mode#generate-}" "$@")
+        ;;
+    *) flow3d_die '用法: bash scripts/submit.sh train|inference|diffusion-smoke|diffusion-train|diffusion-inference|generate-pilot|generate-full [Python 参数]' ;;
 esac
 flow3d_settings
 if [[ "$mode" = inference && "$FLOW3D_GPUS" != 1 ]]; then
@@ -19,6 +23,10 @@ fi
 if [[ "$template" = diffusion && "$FLOW3D_GPUS" != 1 ]]; then
     flow3d_die '真实 diffusion 入口目前只支持单 GPU，请设置 FLOW3D_GPUS=1'
 fi
+if [[ "$template" = generate ]]; then
+    [[ "$FLOW3D_CLUSTER" = delta && "$FLOW3D_GPUS" = 1 ]] || flow3d_die '数据生成使用 Delta，且 FLOW3D_GPUS=1'
+    [[ -f "${FLOW3D_UPSTREAM_REPO:-}/Single_phase/LBM_3D_SinglePhase_Solver.py" ]] || flow3d_die '请先运行 setup_delta_generation.sh 准备上游求解器'
+fi
 command -v sbatch >/dev/null || flow3d_die '请在 NCSA 登录节点提交作业'
 export FLOW3D_CODE_DIR
 FLOW3D_CODE_DIR=$(bash "$code_dir/scripts/prepare_run.sh")
@@ -26,6 +34,9 @@ export FLOW3D_COMMIT
 FLOW3D_COMMIT=$(cat "$FLOW3D_CODE_DIR/.flow3d-commit")
 if [[ "$template" = diffusion && ! -f "$FLOW3D_CODE_DIR/../scripts/run_hpc_diffusion.py" ]]; then
     flow3d_die 'diffusion 作业需要包含根目录 scripts/ 的完整科研仓库'
+fi
+if [[ "$template" = generate && ! -f "$FLOW3D_CODE_DIR/../scripts/run_hpc_generation.py" ]]; then
+    flow3d_die '数据生成需要包含根目录 scripts/ 的完整科研仓库'
 fi
 options=(--account="$FLOW3D_ACCOUNT" --partition="$FLOW3D_PARTITION"
     --nodes=1 --ntasks=1 --cpus-per-task="$FLOW3D_CPUS" --mem="$FLOW3D_MEM"

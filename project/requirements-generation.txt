@@ -1,0 +1,6 @@
+# Python 3.11, Linux x86_64; CUDA PyTorch is installed separately.
+numpy==1.26.4
+taichi==1.7.4
+pyevtk==1.6.0
+sympy==1.13.1
+matplotlib==3.9.2
