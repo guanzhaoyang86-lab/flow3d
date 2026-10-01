@@ -1,0 +1,45 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+*.egg-info/
+build/
+dist/
+
+# Generated data, weights, logs, and rendered deliverables
+data/
+checkpoints/
+logs/
+results/
+/output/
+/outputs/
+/deliverables/
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy
+*.h5
+*.hdf5
+
+# Local environments, dependencies, editor state, and build scratch space
+.venv*/
+.conda/
+node_modules/
+/third_party/
+/tmp/
+/.ppt_build/
+/.codex-finalizer/
+.vscode/
+.idea/
+
+# Machine-specific settings and credentials
+.env
+.env.*
+!.env.example
+.netrc
+.pypirc
+.ssh/
+*.pem
+*.key
+hpc.env

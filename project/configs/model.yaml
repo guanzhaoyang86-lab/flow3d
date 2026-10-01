@@ -1,0 +1,5 @@
+# 仅用于验证开发 / Slurm 工作流的合成数据 MLP；不是论文中的生成式重建模型。
+name: synthetic_mlp
+input_features: 16
+hidden_features: 64
+output_features: 24

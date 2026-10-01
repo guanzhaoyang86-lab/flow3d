@@ -1,0 +1,27 @@
+# 数据、权重和运行产物只留在本地或 HPC。
+data/
+checkpoints/
+logs/
+results/
+experiments/*
+!experiments/README.md
+__pycache__/
+*.py[cod]
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy
+.vscode/
+.idea/
+.venv*/
+.conda/
+.pytest_cache/
+tests/flow3d-submit-*/
+*.egg-info/
+build/
+dist/
+.env
+.env.*
+configs/hpc.env
+.flow3d-commit

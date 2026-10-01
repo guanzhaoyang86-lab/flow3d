@@ -1,0 +1,14 @@
+name: flow3d
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pytorch>=2.5,<3
+  - numpy>=1.26,<3
+  - scipy>=1.11,<2
+  - matplotlib>=3.8,<4
+  - pandas>=2.1,<3
+  - tqdm>=4.66,<5
+  - pyyaml>=6,<7
+# 通用开发环境，不是 CUDA/CPU 架构锁文件；不保证此解算结果包含 GPU 支持。

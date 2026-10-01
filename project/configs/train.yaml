@@ -1,0 +1,13 @@
+experiment_name: synthetic_mlp_demo
+model_config: model.yaml
+seed: 42
+dataset:
+  kind: synthetic
+  version: synthetic-linear-v1
+  samples: 128
+  seed: 123
+training:
+  epochs: 3
+  batch_size: 16
+  learning_rate: 0.001
+  num_workers: 0
