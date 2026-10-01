@@ -3,8 +3,10 @@
 ## GitHub 与 NCSA 工作流（中文）
 
 本仓库包含完整科研源码（根目录的 `src/`、`scripts/`、`tests/`）和
-[中文 HPC 工作流模板](project/README.md)。`project/` 内的合成数据示例用于验证
-GitHub → Slurm → GPU → 实验记录，不会自动替代下文的真实流场重建训练入口。
+[中文 HPC 工作流模板](project/README.md)。你当前的 DeltaAI 分配请使用
+[DeltaAI 真实模型部署说明](docs/deltaai.md)：已配置 ARM/GH200、`biup-dtai-gh`、
+`ghx4` 和站点 PyTorch 2.10.0，通过 `diffusion-*` 作业连接根目录的真实科研模型。
+`project/src/` 的原始小模型仍作为独立工作流示例。
 ACCESS 项目为 `PHY260443`，实际 Slurm 计费账户和存储路径须按站点分配配置。
 
 在 HPC 首次克隆整个仓库后，从 `project/` 运行工作流模板：
@@ -14,14 +16,14 @@ mkdir -p ~/projects
 cd ~/projects
 git clone https://github.com/guanzhaoyang86-lab/flow3d.git project_code
 cd project_code/project
-# 按 project/README.md 配置环境和 ~/.config/flow3d/hpc.env 后执行：
-source ~/.config/flow3d/hpc.env
-FLOW3D_TIME=00:10:00 bash scripts/submit.sh train --smoke-test
+source configs/deltaai.env.example
+bash scripts/submit.sh diffusion-smoke
 ```
 
 仓库为私有，需要在 HPC 配置 GitHub 访问权限。提交脚本会同步整个仓库并保存固定
-提交的源码快照，支持 `project/` 子目录布局。真实科研训练仍使用下文的
-`scripts/train_sparse_track_diffusion.py` 等入口，需要将其接入对应 Slurm 作业。
+提交的源码快照，支持 `project/` 子目录布局。`diffusion-smoke` 使用微型合成数据运行
+真实训练和推理；`diffusion-train` / `diffusion-inference` 接受服务器上已有的数据。
+首次正式训练前必须通过真实 Slurm GPU 小测试；本地 CPU 验证不能替代这一步。
 数据、权重、日志、渲染产物、临时文件、虚拟环境和第三方检出目录均不进入 Git。
 外部 Taichi-LBM3D 依赖按下文固定提交安装。
 

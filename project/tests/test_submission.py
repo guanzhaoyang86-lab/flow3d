@@ -62,7 +62,7 @@ class SubmissionTests(unittest.TestCase):
         with common.open("a", encoding="utf-8", newline="\n") as stream:
             stream.write('\nflow3d_settings() {\n'
                          '  export FLOW3D_CLUSTER=delta FLOW3D_ACCOUNT=PHY260443\n'
-                         '  export FLOW3D_PARTITION=gpuA100x4 FLOW3D_GPUS=2\n'
+                         '  export FLOW3D_PARTITION=gpuA100x4 FLOW3D_GPUS=${FLOW3D_GPUS:-2}\n'
                          '  export FLOW3D_TIME=00:05:00 FLOW3D_CPUS=8 FLOW3D_MEM=32G\n'
                          '  mkdir -p "$FLOW3D_ROOT/logs"\n'
                          '}\n')
@@ -93,6 +93,7 @@ class SubmissionTests(unittest.TestCase):
             "PATH": str(shim) + os.pathsep + self.env.get("PATH", ""),
             "REAL_GIT": posix_path(GIT),
             "FLOW3D_ROOT": posix_path(self.root / "storage"),
+            "FLOW3D_GPUS": "2",
             "FLOW3D_SNAPSHOT_ROOT": posix_path(self.root / "snapshots"),
             "MOCK_SBATCH_CAPTURE": posix_path(self.capture),
             "FLOW3D_TEST_SHIM": posix_path(shim),
@@ -137,9 +138,11 @@ class SubmissionTests(unittest.TestCase):
         self.git("add", ".", cwd=path)
         self.git("commit", "-m", message, cwd=path)
 
-    def submit(self, script="scripts/submit.sh") -> subprocess.CompletedProcess[str]:
+    def submit(self, script="scripts/submit.sh", mode="train", arguments=None) -> subprocess.CompletedProcess[str]:
+        if arguments is None:
+            arguments = ["--name", "two words"]
         return subprocess.run([BASH, "-c", 'export PATH="$FLOW3D_TEST_SHIM:$PATH"; exec bash "$@"',
-                               "flow3d-test", script, "train", "--name", "two words"],
+                               "flow3d-test", script, mode, *arguments],
                               cwd=self.repo, env=self.env, capture_output=True,
                               text=True, encoding="utf-8", errors="replace")
 
@@ -185,6 +188,28 @@ class SubmissionTests(unittest.TestCase):
         (self.repo / "payload.txt").write_text("not pushed\n", encoding="utf-8")
         self.commit(self.repo, "HPC-only change")
         self.assertNotEqual(self.submit().returncode, 0)
+        self.assertFalse(self.capture.exists())
+
+    def test_diffusion_uses_real_entry_in_complete_snapshot(self) -> None:
+        shutil.copytree(self.publisher / "scripts", self.publisher / "project" / "scripts")
+        (self.publisher / "scripts" / "run_hpc_diffusion.py").write_text("# research entry fixture\n")
+        self.commit(self.publisher, "add research entry")
+        self.git("push", cwd=self.publisher)
+        self.git("pull", "--ff-only", cwd=self.repo)
+        self.env["FLOW3D_GPUS"] = "1"
+        result = self.submit("project/scripts/submit.sh", "diffusion-smoke", [])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        args = self.capture.read_bytes().decode("utf-8").rstrip("\0").split("\0")
+        self.assertIn("--gpus-per-node=1", args)
+        self.assertTrue(args[-2].endswith("/scripts/diffusion.slurm"))
+        self.assertEqual(args[-1], "smoke")
+        snapshot = native_path(next(arg.split("=", 1)[1] for arg in args if arg.startswith("--chdir=")))
+        self.assertTrue((snapshot.parent / "scripts" / "run_hpc_diffusion.py").is_file())
+
+    def test_diffusion_rejects_multiple_gpus_before_submission(self) -> None:
+        result = self.submit(mode="diffusion-train", arguments=[])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FLOW3D_GPUS=1", result.stderr)
         self.assertFalse(self.capture.exists())
 
     def test_network_failure_prevents_submission(self) -> None:

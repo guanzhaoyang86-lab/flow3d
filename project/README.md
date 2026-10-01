@@ -4,6 +4,11 @@
 
 本项目提供中文开发与计算工作流：在中国的本地电脑开发、调试和提交代码；GitHub 是唯一代码同步中心；NCSA ACCESS 的 Delta / DeltaAI 负责通过 Slurm 执行 GPU 实验。ACCESS 项目编号为 `PHY260443`。
 
+**当前 zguan2 的 DeltaAI 实际分配请先读 [真实 diffusion 模型部署说明](../docs/deltaai.md)。**
+从完整仓库的 `project/` 目录执行 `source configs/deltaai.env.example` 后，
+用 `bash scripts/submit.sh diffusion-smoke` 首测；`diffusion-train` / `diffusion-inference`
+已连接根目录真实科研代码，支持单 GPU。下文 `train` / `inference` 是通用小模型模板的入口。
+
 当前 `src/` 是可运行的合成数据训练与推理示例，用于验证环境、作业提交和实验记录，**尚未实现论文级生成式三维流场重建模型，也未包含真实数据集**。接入科学模型时，替换 `models/` 和 `datasets/`，保留运行记录与 Slurm 接口。
 
 ```text

@@ -61,6 +61,7 @@ def _nonnegative_float(value: str) -> float:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,
         description="Generate posterior 3D flow samples from sparse tracks."
     )
     parser.add_argument("--checkpoint", type=Path, required=True)

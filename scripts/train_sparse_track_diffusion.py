@@ -73,6 +73,7 @@ def _probability(value: str) -> float:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,
         description=(
             "Train conditional 3D diffusion from sparse projected particle tracks."
         )
