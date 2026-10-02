@@ -223,7 +223,7 @@ def test_auxiliary_boundary_mask_is_explicit_for_batch_size_three(
     assert losses["boundary"].item() == pytest.approx(1.0)
 
 
-def test_resume_is_exact_and_first_resumed_epoch_replaces_best(
+def test_resume_is_exact_and_replaces_stale_best_with_valid_best(
     tmp_path: Path,
 ) -> None:
     case_path = tmp_path / "case.npz"
@@ -310,6 +310,33 @@ def test_resume_is_exact_and_first_resumed_epoch_replaces_best(
     assert {key: uninterrupted["history"][-1][key] for key in metric_keys} == {
         key: resumed["history"][-1][key] for key in metric_keys
     }
+    expected_best = torch.load(uninterrupted_dir / "best.pt", map_location="cpu", weights_only=False)
+    resumed_best = torch.load(resumed_dir / "best.pt", map_location="cpu", weights_only=False)
+    assert expected_best["epoch"] == resumed_best["epoch"]
+    assert expected_best["best_validation_total_loss"] == resumed_best["best_validation_total_loss"]
+
+
+def test_resume_keeps_better_historical_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    case_path, manifest_path = tmp_path / "case.npz", tmp_path / "manifest.json"
+    _CLI_HELPERS._write_eight_cubed_case(case_path)
+    _CLI_HELPERS._write_smoke_manifest(manifest_path, case_path)
+    losses = iter([1.0, 2.0])
+    def validation(*_args, **_kwargs):
+        value = next(losses)
+        return {"total": value, "diffusion": value, "track": 0.0, "divergence": 0.0, "boundary": 0.0}
+    monkeypatch.setattr(_TRAINER, "_run_validation", validation)
+    parser = _TRAINER._build_parser()
+    common = ["--manifest", str(manifest_path), "--device", "cpu", "--no-amp",
+              "--diffusion-steps", "4", "--base-channels", "8", "--condition-dim", "32",
+              "--time-embedding-dim", "16"]
+    first, resumed = tmp_path / "first", tmp_path / "resumed"
+    _TRAINER.train(parser.parse_args([*common, "--epochs", "1", "--output-dir", str(first)]))
+    _TRAINER.train(parser.parse_args([*common, "--epochs", "2", "--output-dir", str(resumed),
+                                     "--resume", str(first / "latest.pt")]))
+    best = torch.load(resumed / "best.pt", map_location="cpu", weights_only=False)
+    latest = torch.load(resumed / "latest.pt", map_location="cpu", weights_only=False)
+    assert best["epoch"] == 1 and latest["epoch"] == 2
+    assert best["best_validation_total_loss"] == latest["best_validation_total_loss"] == 1.0
 
 
 def test_resume_at_completed_target_finalizes_missing_artifacts(
@@ -360,3 +387,57 @@ def test_resume_at_completed_target_finalizes_missing_artifacts(
     summary = json.loads((output_dir / "training_summary.json").read_text())
     assert summary["status"] == "completed"
     assert summary["epochs"] == 1
+
+
+def test_completed_resume_without_historical_best_updates_checkpoint_scores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case_path, manifest_path = tmp_path / "case.npz", tmp_path / "manifest.json"
+    _CLI_HELPERS._write_eight_cubed_case(case_path)
+    _CLI_HELPERS._write_smoke_manifest(manifest_path, case_path)
+    validation_values = iter([(1.0, 0.75), (2.0, 1.5)])
+
+    def validation(*_args, **_kwargs):
+        total, diffusion = next(validation_values)
+        return {"total": total, "diffusion": diffusion, "track": 0.0,
+                "divergence": 0.0, "boundary": total - diffusion}
+
+    monkeypatch.setattr(_TRAINER, "_run_validation", validation)
+    parser = _TRAINER._build_parser()
+    common = ["--manifest", str(manifest_path), "--device", "cpu", "--no-amp",
+              "--diffusion-steps", "4", "--base-channels", "8", "--condition-dim", "32",
+              "--time-embedding-dim", "16", "--epochs", "2"]
+    original_dir = tmp_path / "original"
+    _TRAINER.train(parser.parse_args([*common, "--output-dir", str(original_dir)]))
+    original_latest = torch.load(original_dir / "latest.pt", map_location="cpu", weights_only=False)
+    assert original_latest["best_validation_total_loss"] == 1.0
+    assert original_latest["history"][-1]["validation_total"] == 2.0
+
+    # Simulate moving only latest.pt: the earlier, better epoch's actual weights
+    # are unavailable beside the resume source, despite their score being saved.
+    isolated = tmp_path / "latest_only"
+    isolated.mkdir()
+    isolated_latest = isolated / "latest.pt"
+    torch.save(original_latest, isolated_latest)
+    assert _TRAINER._historical_best(original_latest, isolated_latest) is None
+    finalized = tmp_path / "finalized"
+    returned = _TRAINER.train(parser.parse_args([
+        *common, "--output-dir", str(finalized), "--resume", str(isolated_latest),
+    ]))
+    assert returned == finalized / "best.pt"
+    summary = json.loads((finalized / "training_summary.json").read_text())
+    assert summary["best_validation_total_loss"] == 2.0
+    assert summary["best_validation_diffusion_loss"] == 1.5
+    for filename in ("best.pt", "latest.pt"):
+        path = finalized / filename
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        assert payload["epoch"] == 2
+        assert payload["best_validation_total_loss"] == summary["best_validation_total_loss"]
+        assert payload["best_validation_diffusion_loss"] == summary["best_validation_diffusion_loss"]
+        assert payload["history"] == original_latest["history"]
+        for group in ("encoder_state", "unet_state", "ema_encoder_state", "ema_unet_state"):
+            for key, expected in original_latest[group].items():
+                torch.testing.assert_close(payload[group][key], expected, atol=0, rtol=0)
+        # Recognition succeeds directly from the payload, not by finding a
+        # different sibling's weights. No extra epoch was needed to repair it.
+        assert _TRAINER._historical_best(payload, path) is payload

@@ -5,6 +5,9 @@ source "$code_dir/scripts/common.sh"
 mode="${1:-train}"
 if (( $# )); then shift; fi
 case "$mode" in
+    tensor-prepare|matrix-train|matrix-evaluate|matrix-resume)
+        exec bash "$code_dir/scripts/submit_matrix.sh" "$mode" "$@"
+        ;;
     train|inference) template="$mode"; run_args=("$@") ;;
     diffusion-smoke|diffusion-train|diffusion-inference)
         template=diffusion

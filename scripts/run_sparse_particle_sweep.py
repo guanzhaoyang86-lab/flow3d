@@ -29,7 +29,8 @@ import numpy as np
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_SAMPLER = _REPOSITORY_ROOT / "scripts" / "sample_sparse_track_diffusion.py"
-_SUPPORTED_PARTICLE_COUNTS = (2, 4, 8, 32, 64, 128)
+_SUPPORTED_PARTICLE_COUNTS = (2, 4, 6, 8, 12, 24, 32, 48, 64, 96, 128)
+_DEFAULT_PARTICLE_COUNTS = (2, 4, 6, 12, 24, 48, 96)
 _EXTRAPOLATION_WARNING = (
     "NON-SCIENTIFIC: one fixed-particle-count checkpoint was evaluated at "
     "untrained particle counts. These runs are exploratory extrapolations, "
@@ -96,10 +97,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--particle-counts",
         type=_particle_counts,
-        default=_SUPPORTED_PARTICLE_COUNTS,
+        default=_DEFAULT_PARTICLE_COUNTS,
         help=(
-            "Comma-separated subset selected from 2,4,8,32,64,128 "
-            "(default: all six)."
+            "Comma-separated counts (default: 2,4,6,12,24,48,96); legacy counts also supported."
         ),
     )
     parser.add_argument(
@@ -110,7 +110,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="N=PATH",
         help=(
             "Checkpoint trained for exactly N particles. Repeat once for every "
-            "N in 2,4,8,32,64,128 (scientific default)."
+            "requested N (scientific default)."
         ),
     )
     parser.add_argument(
@@ -145,6 +145,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--eta", type=_nonnegative_float, default=1.0)
     parser.add_argument("--cfg-scale", type=_nonnegative_float, default=1.5)
+    parser.add_argument("--boundary-projection", choices=("final", "each-step"), default="each-step")
     parser.add_argument(
         "--trajectory-guidance-strength", type=_nonnegative_float, default=0.0
     )
@@ -287,6 +288,8 @@ def _build_sampler_command(
         format(args.eta, ".12g"),
         "--cfg-scale",
         format(args.cfg_scale, ".12g"),
+        "--boundary-projection",
+        args.boundary_projection,
         "--trajectory-guidance-strength",
         format(args.trajectory_guidance_strength, ".12g"),
         "--divergence-guidance-weight",
@@ -509,6 +512,9 @@ def _build_summary(
         "num_posterior_samples": args.num_samples,
         "num_probe_particles": args.num_probe_particles,
         "sampling_steps": args.sampling_steps,
+        "boundary_projection": args.boundary_projection,
+        "eta": args.eta,
+        "cfg_scale": args.cfg_scale,
         "device": args.device,
         "manifest": str(args.manifest.expanduser().resolve()),
         "per_particle_count": per_count,

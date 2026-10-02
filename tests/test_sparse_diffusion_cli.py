@@ -376,6 +376,7 @@ def _sweep_resume_arguments(
     arguments = [
         "--manifest",
         str(manifest_path),
+        "--particle-counts", "2,4,8,32,64,128",
         "--allow-untrained-count-extrapolation",
         "--shared-checkpoint",
         str(checkpoint_path),

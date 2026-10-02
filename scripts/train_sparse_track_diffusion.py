@@ -36,6 +36,7 @@ if str(_SOURCE_ROOT) not in sys.path:
 from flow_observation.diffusion import GaussianDiffusion
 from flow_observation.models.trajectory_encoder import TrackSetEncoder
 from flow_observation.models.unet3d import ConditionalUNet3D
+from flow_observation.models.factory import build_denoiser, diffusion_clip
 from flow_observation.sparse_dataset import (
     FlowNormalizationStats,
     SparseFlowDataset,
@@ -94,6 +95,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--diffusion-steps", type=_positive_integer, default=1000)
     parser.add_argument("--schedule", choices=("cosine", "linear"), default="cosine")
     parser.add_argument("--base-channels", type=_positive_integer, default=16)
+    parser.add_argument("--architecture", choices=("unet3d", "dit3d", "tensor-dit"), default="unet3d")
+    parser.add_argument("--tensor-artifact", type=Path, help="Train-only aligned tensor codec/cache from prepare_tensor_space.py")
+    parser.add_argument("--dit-hidden-dim", type=_positive_integer, default=192)
+    parser.add_argument("--dit-depth", type=_positive_integer, default=4)
+    parser.add_argument("--dit-heads", type=_positive_integer, default=6)
+    parser.add_argument("--patch-size", type=_positive_integer, default=4)
     parser.add_argument("--condition-dim", type=_positive_integer, default=128)
     parser.add_argument("--time-embedding-dim", type=_positive_integer, default=64)
     parser.add_argument("--dropout", type=_probability, default=0.0)
@@ -393,10 +400,13 @@ def _checkpoint_payload(
     stats: FlowNormalizationStats,
     provenance: dict[str, object],
     args: argparse.Namespace,
+    model_config: dict[str, Any] | None = None,
+    tensor_codec: dict[str, Any] | None = None,
+    tensor_artifact_sha256: str | None = None,
 ) -> dict[str, object]:
     return {
         "format_version": 1,
-        "method": "two-particle conditional 3D flow diffusion",
+        "method": f"{args.num_particles}-particle conditional flow diffusion",
         "epoch": epoch,
         "best_validation_total_loss": best_validation_total,
         # Retained for older format-version-1 readers.  New training runs use
@@ -414,7 +424,7 @@ def _checkpoint_payload(
         ),
         "diffusion_state": diffusion.state_dict(),
         "normalization": stats.to_dict(),
-        "model_config": {
+        "model_config": model_config or {
             "condition_dim": args.condition_dim,
             "base_channels": args.base_channels,
             "channel_multipliers": [1, 2, 4],
@@ -430,6 +440,8 @@ def _checkpoint_payload(
             "split_unit": "independent flow case",
         },
         "training_provenance": provenance,
+        "tensor_codec": tensor_codec,
+        "tensor_artifact_sha256": tensor_artifact_sha256,
         "train_config": vars(args),
     }
 
@@ -473,6 +485,8 @@ def _run_validation(
     device: torch.device,
     stats: FlowNormalizationStats,
     args: argparse.Namespace,
+    tensor_codec: Any = None,
+    latent_cache: dict[str, Tensor] | None = None,
 ) -> dict[str, float]:
     encoder.eval()
     unet.eval()
@@ -489,21 +503,22 @@ def _run_validation(
             batch = _tensor_batch_to_device(raw_batch, device)
             condition = _encode_condition(encoder, batch)
             batch_size = int(batch["flow"].shape[0])
+            clean = _diffusion_target(batch, latent_cache)
             timesteps, noise = _fixed_validation_inputs(
-                batch["flow"],
+                clean,
                 sample_offset=count,
                 diffusion_steps=args.diffusion_steps,
                 seed=args.seed + 10_000_019,
             )
             result = diffusion.training_loss(
                 unet,
-                batch["flow"],
+                clean,
                 condition,
                 timesteps=timesteps,
                 noise=noise,
             )
             auxiliary = _auxiliary_losses(
-                result["predicted_x0"].float(),
+                _decode_auxiliary(result["predicted_x0"], tensor_codec, args),
                 result["timesteps"],
                 batch,
                 stats,
@@ -523,6 +538,51 @@ def _run_validation(
     return {name: value / max(count, 1) for name, value in accumulated.items()}
 
 
+def _diffusion_target(batch: dict[str, Any], cache: dict[str, Tensor] | None) -> Tensor:
+    if cache is None:
+        return batch["flow"]
+    return torch.stack([cache[key] for key in batch["case_id"]]).to(
+        device=batch["flow"].device, dtype=torch.float32
+    )
+
+
+def _decode_auxiliary(value: Tensor, codec: Any, args: argparse.Namespace) -> Tensor:
+    value = value.float()
+    if codec is None or not any((args.track_loss_weight, args.divergence_loss_weight,
+                                  args.boundary_loss_weight)):
+        return value
+    with torch.autocast(device_type=value.device.type, enabled=False):
+        return codec.decode(value)
+
+
+def _atomic_checkpoint(payload: dict[str, Any], path: Path) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+
+
+def _historical_best(resume: dict[str, Any], resume_path: Path) -> dict[str, Any] | None:
+    """Recover the actual best weights, never just a historical loss scalar."""
+    candidates = [resume]
+    sibling = resume_path.parent / "best.pt"
+    if sibling.is_file() and sibling != resume_path:
+        candidates.append(torch.load(sibling, map_location="cpu", weights_only=False))
+    expected_loss = resume.get("best_validation_total_loss")
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or not candidate.get("history"):
+            continue
+        if (candidate.get("model_config") != resume.get("model_config")
+                or candidate.get("training_provenance") != resume.get("training_provenance")
+                or candidate.get("tensor_artifact_sha256") != resume.get("tensor_artifact_sha256")
+                or candidate.get("data_config", {}).get("num_particles") != resume["data_config"]["num_particles"]
+                or candidate.get("epoch", 0) > resume["epoch"]):
+            continue
+        actual_loss = candidate["history"][-1].get("validation_total")
+        if expected_loss is not None and actual_loss == expected_loss:
+            return candidate
+    return None
+
+
 def train(args: argparse.Namespace) -> Path:
     if args.num_workers < 0:
         raise ValueError("--num-workers must be non-negative")
@@ -534,9 +594,25 @@ def train(args: argparse.Namespace) -> Path:
     _seed_everything(args.seed, use_cuda=device.type == "cuda")
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.resume is None and any((output_dir / name).exists() for name in ("latest.pt", "best.pt", "training_summary.json")):
+        raise ValueError("training output already exists; choose a new directory or use --resume")
     provenance = _training_provenance(args.manifest)
 
-    stats = compute_train_flow_stats(args.manifest)
+    architecture = getattr(args, "architecture", "unet3d")
+    artifact_path = getattr(args, "tensor_artifact", None)
+    if (architecture == "tensor-dit") != (artifact_path is not None):
+        raise ValueError("--tensor-artifact is required only for --architecture tensor-dit")
+    tensor_codec = None
+    tensor_artifact = None
+    artifact_sha256 = None
+    if artifact_path is not None:
+        from flow_observation.tensor_space import TensorSpaceCodec, load_tensor_space_artifact
+        tensor_artifact = load_tensor_space_artifact(artifact_path, manifest_path=args.manifest)
+        tensor_codec = TensorSpaceCodec.from_artifact(tensor_artifact).to(device)
+        artifact_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        stats = FlowNormalizationStats.from_dict(tensor_artifact["normalization_stats"])
+    else:
+        stats = compute_train_flow_stats(args.manifest)
     train_dataset = SparseFlowDataset(
         args.manifest,
         "train",
@@ -578,16 +654,24 @@ def train(args: argparse.Namespace) -> Path:
         pin_memory=device.type == "cuda",
     )
 
+    model_config = {
+        "condition_dim": args.condition_dim, "base_channels": args.base_channels,
+        "channel_multipliers": [1, 2, 4], "time_embedding_dim": args.time_embedding_dim,
+        "dropout": args.dropout, "diffusion_steps": args.diffusion_steps, "schedule": args.schedule,
+    }
+    if architecture != "unet3d":
+        spatial_shape = list(train_dataset[0]["flow"].shape[-3:])
+        model_config.update(architecture=architecture, spatial_shape=spatial_shape,
+                            dit_hidden_dim=args.dit_hidden_dim, dit_depth=args.dit_depth,
+                            dit_heads=args.dit_heads, patch_size=args.patch_size)
+        if tensor_codec is not None:
+            if tuple(spatial_shape) != tuple(tensor_codec.spatial_shape):
+                raise ValueError("tensor artifact shape does not match training fields")
+            model_config["tensor_rank"] = tensor_codec.rank
     encoder = TrackSetEncoder(condition_dim=args.condition_dim).to(device)
-    unet = ConditionalUNet3D(
-        condition_dim=args.condition_dim,
-        base_channels=args.base_channels,
-        channel_multipliers=(1, 2, 4),
-        time_embedding_dim=args.time_embedding_dim,
-        dropout=args.dropout,
-    ).to(device)
+    unet = build_denoiser(model_config).to(device)
     diffusion = GaussianDiffusion(
-        args.diffusion_steps, schedule=args.schedule, clip_x0=8.0
+        args.diffusion_steps, schedule=args.schedule, clip_x0=diffusion_clip(model_config)
     ).to(device)
     ema_encoder = copy.deepcopy(encoder).eval().requires_grad_(False)
     ema_unet = copy.deepcopy(unet).eval().requires_grad_(False)
@@ -598,9 +682,8 @@ def train(args: argparse.Namespace) -> Path:
     )
     amp_enabled = bool(args.amp and device.type == "cuda")
     scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled)
-    # Best is scoped to this invocation.  In particular, the first completed
-    # resumed epoch must materialize best.pt in either a new or reused output
-    # directory; it must never silently return a stale/missing artifact.
+    # Preserve the best weights over the whole run, including an interrupted
+    # invocation. If those weights are missing, explicitly restart selection.
     best_validation = float("inf")
     best_validation_diffusion = float("inf")
     history: list[dict[str, float | int]] = []
@@ -612,19 +695,17 @@ def train(args: argparse.Namespace) -> Path:
         if not isinstance(resume, dict) or resume.get("format_version") != 1:
             raise ValueError("--resume is not a supported sparse diffusion checkpoint")
         saved_config = resume.get("model_config", {})
-        expected_config = {
-            "condition_dim": args.condition_dim,
-            "base_channels": args.base_channels,
-            "channel_multipliers": [1, 2, 4],
-            "time_embedding_dim": args.time_embedding_dim,
-            "dropout": args.dropout,
-            "diffusion_steps": args.diffusion_steps,
-            "schedule": args.schedule,
-        }
+        expected_config = model_config
         if saved_config != expected_config:
             raise ValueError(
                 "--resume model configuration differs from the current arguments"
             )
+        if resume.get("tensor_artifact_sha256") != artifact_sha256:
+            raise ValueError("--resume tensor artifact differs from the current artifact")
+        saved_training = resume.get("train_config", {})
+        for key in ("seed", "observations_per_flow", "batch_size", "gradient_accumulation"):
+            if key in saved_training and saved_training[key] != getattr(args, key):
+                raise ValueError(f"--resume {key} differs from the current arguments")
         saved_particles = int(resume["data_config"]["num_particles"])
         if saved_particles != args.num_particles:
             raise ValueError(
@@ -669,6 +750,13 @@ def train(args: argparse.Namespace) -> Path:
         if not isinstance(saved_history, list):
             raise ValueError("--resume checkpoint history is invalid")
         history = list(saved_history)
+        historical_best = _historical_best(resume, resume_path)
+        if historical_best is not None:
+            best_validation = float(historical_best["history"][-1]["validation_total"])
+            best_validation_diffusion = float(historical_best["history"][-1]["validation_diffusion"])
+            _atomic_checkpoint(historical_best, output_dir / "best.pt")
+        else:
+            print("Warning: historical best weights unavailable; best selection restarts from this continuation.", flush=True)
         if start_epoch == args.epochs + 1:
             resume_at_completed_target = resume
             best_validation = float(
@@ -703,8 +791,21 @@ def train(args: argparse.Namespace) -> Path:
     # impossible extra epoch.
     if resume_at_completed_target is not None:
         best_path = output_dir / "best.pt"
-        if not best_path.is_file():
-            torch.save(resume_at_completed_target, best_path)
+        if historical_best is None:
+            if history:
+                best_validation = float(history[-1]["validation_total"])
+                best_validation_diffusion = float(history[-1]["validation_diffusion"])
+                # These are the latest weights, not the unavailable historical
+                # optimum. Keep checkpoint scores consistent with the weights
+                # and summary so a later continuation can recognize this best.
+                resume_at_completed_target = {
+                    **resume_at_completed_target,
+                    "best_validation_total_loss": best_validation,
+                    "best_validation_diffusion_loss": best_validation_diffusion,
+                }
+            _atomic_checkpoint(resume_at_completed_target, best_path)
+        # Materialize latest.pt even when finalizing into a different directory.
+        _atomic_checkpoint(resume_at_completed_target, output_dir / "latest.pt")
         summary = {
             "status": "completed",
             "device": str(device),
@@ -716,6 +817,8 @@ def train(args: argparse.Namespace) -> Path:
             "scientific_result": not train_dataset.is_smoke_test,
             "training_provenance": provenance,
             "normalization": stats.to_dict(),
+            "architecture": architecture,
+            "tensor_artifact_sha256": artifact_sha256,
         }
         (output_dir / "training_summary.json").write_text(
             json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
@@ -742,10 +845,10 @@ def train(args: argparse.Namespace) -> Path:
                     dropout_probability=args.condition_dropout,
                 )
                 diffusion_result = diffusion.training_loss(
-                    unet, batch["flow"], condition
+                    unet, _diffusion_target(batch, tensor_artifact["latents"]["train"] if tensor_artifact else None), condition
                 )
                 auxiliary = _auxiliary_losses(
-                    diffusion_result["predicted_x0"].float(),
+                    _decode_auxiliary(diffusion_result["predicted_x0"], tensor_codec, args),
                     diffusion_result["timesteps"],
                     batch,
                     stats,
@@ -762,6 +865,8 @@ def train(args: argparse.Namespace) -> Path:
                     batch_index, len(train_loader), args.gradient_accumulation
                 )
                 scaled_loss = total_loss / window_size
+            if not bool(torch.isfinite(total_loss).detach()):
+                raise RuntimeError(f"non-finite training loss at epoch {epoch}, batch {batch_index}")
             scaler.scale(scaled_loss).backward()
             should_step = (
                 (batch_index + 1) % args.gradient_accumulation == 0
@@ -796,6 +901,8 @@ def train(args: argparse.Namespace) -> Path:
             device,
             stats,
             args,
+            tensor_codec=tensor_codec,
+            latent_cache=tensor_artifact["latents"]["validation"] if tensor_artifact else None,
         )
         if not math.isfinite(validation["total"]):
             raise RuntimeError("validation total loss is not finite")
@@ -836,17 +943,20 @@ def train(args: argparse.Namespace) -> Path:
             stats=stats,
             provenance=provenance,
             args=args,
+            model_config=model_config,
+            tensor_codec=tensor_codec.to_artifact() if tensor_codec is not None else None,
+            tensor_artifact_sha256=artifact_sha256,
         )
         payload["history"] = history
-        torch.save(payload, output_dir / "latest.pt")
+        _atomic_checkpoint(payload, output_dir / "latest.pt")
         if improves_best:
             best_validation = validation["total"]
             best_validation_diffusion = validation["diffusion"]
             payload["best_validation_total_loss"] = best_validation
             payload["best_validation_diffusion_loss"] = best_validation_diffusion
-            torch.save(payload, output_dir / "best.pt")
+            _atomic_checkpoint(payload, output_dir / "best.pt")
         if epoch % args.save_every == 0:
-            torch.save(payload, output_dir / f"epoch_{epoch:04d}.pt")
+            _atomic_checkpoint(payload, output_dir / f"epoch_{epoch:04d}.pt")
 
     summary = {
         "status": "completed",
@@ -859,6 +969,11 @@ def train(args: argparse.Namespace) -> Path:
         "scientific_result": not train_dataset.is_smoke_test,
         "training_provenance": provenance,
         "normalization": stats.to_dict(),
+        "architecture": architecture,
+        "model_config": model_config,
+        "tensor_artifact_sha256": artifact_sha256,
+        "trainable_parameters": sum(p.numel() for p in [*encoder.parameters(), *unet.parameters()]),
+        "elapsed_seconds": sum(float(row["elapsed_seconds"]) for row in history),
     }
     (output_dir / "training_summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"

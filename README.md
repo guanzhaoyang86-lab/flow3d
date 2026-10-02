@@ -12,6 +12,10 @@
 在同一个 Slurm 作业内接着训练。数据写入共享的 `/work/hdd`，也可供 DeltaAI 使用。
 ACCESS 项目为 `PHY260443`，实际 Slurm 计费账户和存储路径须按站点分配配置。
 
+新增 [GH200 / DiffATS 与 DiT 实验矩阵](docs/diffats-experiments.md)：对比完整三维
+U-Net、完整三维 DiT、对齐 Tucker 空间 DiT，覆盖 2、4、6、12、24、48、96 个粒子。
+先在 Slurm 中检查降阶重建误差，再运行 9 项试跑与 63 项正式训练；所有结果保存在共享工作盘。
+
 在 HPC 首次克隆整个仓库后，从 `project/` 运行工作流模板：
 
 ```bash

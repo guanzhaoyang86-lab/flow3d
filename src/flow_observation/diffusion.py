@@ -1,7 +1,7 @@
 """Small, dependency-free Gaussian diffusion utilities for 3D flow fields.
 
-The diffusion variable is a normalized velocity volume with shape
-``[B, 3, D, H, W]``.  Conditioning is intentionally opaque to this module:
+The diffusion variable is a normalized velocity volume ``[B,3,D,H,W]`` or
+an aligned tensor primitive ``[B,L]``. Conditioning is opaque to this module:
 the supplied denoiser receives ``(noisy_field, diffusion_step, condition)``.
 This keeps the schedule/sampler reusable with either sparse-track conditions
 or an unconditional flow prior.
@@ -193,7 +193,7 @@ class GaussianDiffusion(nn.Module):
     def ddim_sample(
         self,
         denoiser: Denoiser,
-        shape: tuple[int, int, int, int, int],
+        shape: tuple[int, ...],
         condition: Condition,
         *,
         sampling_steps: int | None = None,
@@ -217,8 +217,10 @@ class GaussianDiffusion(nn.Module):
         constraint such as overwriting known cavity boundaries.
         """
 
-        if len(shape) != 5 or shape[1] != 3 or any(value < 1 for value in shape):
-            raise ValueError("shape must be [B,3,D,H,W] with positive dimensions")
+        if not ((len(shape) == 5 and shape[1] == 3) or len(shape) == 2) or any(
+            value < 1 for value in shape
+        ):
+            raise ValueError("shape must be [B,3,D,H,W] or [B,L] with positive dimensions")
         steps = self.num_steps if sampling_steps is None else int(sampling_steps)
         if not 1 <= steps <= self.num_steps:
             raise ValueError("sampling_steps must be in [1, num_steps]")
@@ -337,8 +339,10 @@ class GaussianDiffusion(nn.Module):
     def _validate_field(field: Tensor) -> None:
         if not isinstance(field, Tensor):
             raise TypeError("flow fields must be torch.Tensor instances")
-        if field.ndim != 5 or field.shape[1] != 3:
-            raise ValueError("flow fields must have shape [B,3,D,H,W]")
+        if not ((field.ndim == 5 and field.shape[1] == 3) or field.ndim == 2):
+            raise ValueError("diffusion data must have shape [B,3,D,H,W] or [B,L]")
+        if any(d < 1 for d in field.shape):
+            raise ValueError("diffusion dimensions must be non-empty")
         if not field.is_floating_point():
             raise TypeError("flow fields must be floating point")
         if not bool(torch.isfinite(field).all().detach()):

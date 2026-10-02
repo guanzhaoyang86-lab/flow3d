@@ -24,6 +24,7 @@ if str(_SOURCE_ROOT) not in sys.path:
 from flow_observation.diffusion import GaussianDiffusion
 from flow_observation.models.trajectory_encoder import TrackSetEncoder
 from flow_observation.models.unet3d import ConditionalUNet3D
+from flow_observation.models.factory import build_denoiser, diffusion_clip
 from flow_observation.sparse_dataset import (
     FlowNormalizationStats,
     SparseFlowDataset,
@@ -74,6 +75,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sampling-steps", type=_positive_integer, default=50)
     parser.add_argument("--eta", type=_nonnegative_float, default=1.0)
     parser.add_argument("--cfg-scale", type=_nonnegative_float, default=1.5)
+    parser.add_argument("--boundary-projection", choices=("final", "each-step"), default="each-step",
+                        help="Use final for comparisons with tensor-dit; latent decoding enforces boundaries at the end.")
     parser.add_argument(
         "--trajectory-guidance-strength", type=_nonnegative_float, default=0.0
     )
@@ -262,13 +265,7 @@ def _load_models(
 ) -> tuple[TrackSetEncoder, ConditionalUNet3D, GaussianDiffusion, FlowNormalizationStats]:
     config = checkpoint["model_config"]
     encoder = TrackSetEncoder(condition_dim=int(config["condition_dim"]))
-    unet = ConditionalUNet3D(
-        condition_dim=int(config["condition_dim"]),
-        base_channels=int(config["base_channels"]),
-        channel_multipliers=tuple(int(v) for v in config["channel_multipliers"]),
-        time_embedding_dim=int(config["time_embedding_dim"]),
-        dropout=float(config["dropout"]),
-    )
+    unet = build_denoiser(config)
     if use_raw:
         encoder.load_state_dict(checkpoint["encoder_state"])
         unet.load_state_dict(checkpoint["unet_state"])
@@ -278,7 +275,7 @@ def _load_models(
     diffusion = GaussianDiffusion(
         int(config["diffusion_steps"]),
         schedule=str(config["schedule"]),
-        clip_x0=8.0,
+        clip_x0=diffusion_clip(config),
     )
     diffusion.load_state_dict(checkpoint["diffusion_state"])
     stats = FlowNormalizationStats.from_dict(checkpoint["normalization"])
@@ -343,6 +340,17 @@ def sample(args: argparse.Namespace) -> Path:
     encoder, unet, diffusion, stats = _load_models(
         checkpoint, device, args.use_raw_weights
     )
+    tensor_codec = None
+    architecture = checkpoint["model_config"].get("architecture", "unet3d")
+    if architecture == "tensor-dit":
+        from flow_observation.tensor_space import TensorSpaceCodec
+        if not isinstance(checkpoint.get("tensor_codec"), dict):
+            raise ValueError("tensor-dit checkpoint is missing its self-contained codec")
+        tensor_codec = TensorSpaceCodec.from_artifact(checkpoint["tensor_codec"]).to(device)
+        if tuple(tensor_codec.spatial_shape) != tuple(batch["flow"].shape[-3:]):
+            raise ValueError("checkpoint spatial shape differs from evaluation field")
+        if tensor_codec.rank != checkpoint["model_config"]["tensor_rank"]:
+            raise ValueError("checkpoint tensor rank and codec disagree")
     with torch.no_grad():
         condition = encoder(
             batch["tracks"],
@@ -359,9 +367,13 @@ def sample(args: argparse.Namespace) -> Path:
         )
         return normalize_flow(physical, stats)
 
+    def decode(value: Tensor) -> Tensor:
+        with torch.autocast(device_type=device.type, enabled=False):
+            return tensor_codec.decode(value.float()) if tensor_codec is not None else value.float()
+
     def observation_guidance(normalized: Tensor, timesteps: Tensor) -> Tensor:
         del timesteps
-        physical = denormalize_flow(normalized, stats)
+        physical = denormalize_flow(decode(normalized), stats)
         physical = apply_hard_boundary_conditions(
             physical, boundary_mask, batch["boundary_values"]
         )
@@ -384,6 +396,8 @@ def sample(args: argparse.Namespace) -> Path:
         return loss
 
     shape = (1, *tuple(int(value) for value in batch["flow"].shape[1:]))
+    if tensor_codec is not None:
+        shape = (1, tensor_codec.latent_dim)
     posterior_samples: list[Tensor] = []
     generator_device = device.type if device.type == "cuda" else "cpu"
     generator = torch.Generator(device=generator_device).manual_seed(args.seed)
@@ -402,16 +416,18 @@ def sample(args: argparse.Namespace) -> Path:
                 else None
             ),
             guidance_strength=args.trajectory_guidance_strength,
-            projection=hard_projection,
+            projection=(hard_projection if tensor_codec is None and args.boundary_projection == "each-step" else None),
             generator=generator,
             device=device,
         )
         physical = apply_hard_boundary_conditions(
-            denormalize_flow(normalized, stats),
+            denormalize_flow(decode(normalized), stats),
             boundary_mask,
             batch["boundary_values"],
         )
         posterior_samples.append(physical[0].detach().cpu())
+        if not bool(torch.isfinite(physical).all()):
+            raise RuntimeError("sampling produced a non-finite decoded velocity field")
         print(
             f"sample {sample_index + 1}/{args.num_samples} complete", flush=True
         )
@@ -482,6 +498,10 @@ def sample(args: argparse.Namespace) -> Path:
         )
     metadata = {
         "method": f"{num_particles}-particle conditional 3D flow diffusion",
+        "architecture": architecture,
+        "model_config": checkpoint["model_config"],
+        "tensor_artifact_sha256": checkpoint.get("tensor_artifact_sha256"),
+        "boundary_projection": "final" if tensor_codec is not None else args.boundary_projection,
         "checkpoint": str(checkpoint_path),
         "case_id": item["case_id"],
         "split": args.split,
