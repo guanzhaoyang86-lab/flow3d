@@ -215,7 +215,9 @@ def _load_submission_fixture():
     return module
 
 
-def test_slurm_array_reuses_one_snapshot_and_preserves_dry_run(tmp_path):
+@pytest.mark.parametrize("mode,dependency", [("matrix-train", ""), ("matrix-followup", "12345"),
+                                             ("matrix-followup", "")])
+def test_slurm_array_reuses_one_snapshot_and_preserves_dry_run(tmp_path, mode, dependency):
     """Real local Git snapshots + mocked planner/sbatch; no network/GPU."""
     fixture = _load_submission_fixture()
     if not fixture.BASH or not fixture.GIT:
@@ -235,25 +237,40 @@ def test_slurm_array_reuses_one_snapshot_and_preserves_dry_run(tmp_path):
                           'case "$2" in\n'
                           'plan) printf "%s/plan.json\\n" "$FLOW3D_ROOT" ;;\n'
                           'inspect) case "${6}" in\n'
-                          'count) echo 63 ;;\n'
+                          'count) echo "$MOCK_MATRIX_COUNT" ;;\n'
                           'mode) echo matrix-train ;;\n'
                           'sha256) echo 0123456789abcdef ;;\n'
                           'esac ;;\n'
-                          'array) echo 0-62 ;;\n'
+                          'array) echo "0-$((MOCK_MATRIX_COUNT - 1))" ;;\n'
+                          'dependency) printf "%s\\n" "$MOCK_MATRIX_DEPENDENCY" ;;\n'
                           'check-time) exit 0 ;;\n'
                           '*) exit 3 ;;\n'
                           'esac\n')
+        count = 9 if mode == "matrix-followup" else 63
+        case.env.update(MOCK_MATRIX_COUNT=str(count), MOCK_MATRIX_DEPENDENCY=dependency)
+        case.write_script(case.root / "bin/uname", '#!/bin/bash\necho x86_64\n')
         case.commit(case.publisher, "matrix fixture")
         case.git("push", cwd=case.publisher)
         case.git("pull", "--ff-only", cwd=case.repo)
-        result = case.submit("project/scripts/submit.sh", "matrix-train", ["--dry-run"])
+        result = case.submit("project/scripts/submit.sh", mode, ["--dry-run"])
         assert result.returncode == 0, result.stdout + result.stderr
         assert not case.capture.exists()
         assert not (case.root / "snapshots").exists()
-        result = case.submit("project/scripts/submit.sh", "matrix-train", [])
+        result = case.submit("project/scripts/submit.sh", mode, [])
+        assert result.returncode != 0
+        assert "DeltaAI" in result.stderr
+        assert not case.capture.exists()
+        assert not (case.root / "snapshots").exists()
+        case.write_script(case.root / "bin/uname", '#!/bin/bash\necho aarch64\n')
+        result = case.submit("project/scripts/submit.sh", mode, [])
         assert result.returncode == 0, result.stdout + result.stderr
         options = case.capture.read_bytes().decode().rstrip("\0").split("\0")
-        assert "--array=0-62%4" in options
+        assert f"--array=0-{count - 1}%4" in options
+        if dependency:
+            assert f"--dependency=afterok:{dependency}" in options
+            assert "--kill-on-invalid-dep=yes" in options
+        else:
+            assert not any(option.startswith("--dependency") for option in options)
         assert "--gpus-per-node=1" in options
         assert "--account=biup-dtai-gh" in options
         assert "--partition=ghx4" in options

@@ -5,7 +5,7 @@ source "$code_dir/scripts/common.sh"
 mode="${1:-train}"
 if (( $# )); then shift; fi
 case "$mode" in
-    tensor-prepare|matrix-train|matrix-evaluate|matrix-resume)
+    tensor-prepare|matrix-train|matrix-evaluate|matrix-resume|matrix-followup)
         exec bash "$code_dir/scripts/submit_matrix.sh" "$mode" "$@"
         ;;
     train|inference) template="$mode"; run_args=("$@") ;;

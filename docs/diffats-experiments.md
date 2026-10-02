@@ -53,7 +53,57 @@ bash scripts/submit.sh tensor-prepare --ranks 4,8,12,16
 
 终端打印 `计划：.../plan.json` 和 Slurm JOB_ID。压缩输出目录记录在该计划的 `prepare_output` 字段；完成后里面有 `report.json` 与 `rank_4.pt`、`rank_8.pt`、`rank_12.pt`、`rank_16.pt`。查看报告的验证误差、各速度分量及物理重建指标后，再选一个秩；不要默认认为更高压缩比更好。锚点重叠与近似重建误差需要一起检查。
 
+## 当前预处理自动衔接 9 组试跑
+
+已经提交的 `tensor-prepare` 只有一个计算任务，它依次准备各秩的缓存，不包含 63 组训练。可以现在另提交一个有依赖的试跑数组：预处理成功后自动选秩，再开始 9 个独立训练子任务，无需重新运行预处理，也无需保持 SSH 在线。正式 63 组训练仍需要检查试跑结果后手动提交。
+
+先在 DeltaAI 的 `gh-login...` 窗口更新代码并加载配置；`uname -m` 应为 `aarch64`：
+
+```bash
+cd ~/projects/project_code &&
+git pull --ff-only &&
+cd project &&
+module load python/miniforge3_pytorch/2.10.0 &&
+conda activate base &&
+source configs/deltaai-matrix.env.example
+```
+
+找到当前预处理提交时打印的完整 `计划：.../plan.json` 路径和 Slurm 数组主编号，替换下方两个示例值。不要使用 `--dry-run` 产生的预处理计划；数组编号应为 `1234567` 这种主编号，不带 `_0` 子任务后缀。
+
+```bash
+export PREPARE_PLAN=/work/hdd/biup/zguan2/results/matrices/实际预处理计划/plan.json
+export PREPARE_JOB_ID=1234567
+
+bash scripts/submit.sh matrix-followup \
+  --prepare-plan "$PREPARE_PLAN" --after-job "$PREPARE_JOB_ID" --dry-run
+
+bash scripts/submit.sh matrix-followup \
+  --prepare-plan "$PREPARE_PLAN" --after-job "$PREPARE_JOB_ID"
+```
+
+正式命令仅执行一次，并保存它打印的新训练计划路径和数组编号。该命令不会修改已有的预处理作业。预处理尚未完成时，新数组设置 `afterok` 依赖：提交后就进入队列等待，预处理成功退出后才满足依赖条件，是否立即获得 GH200 仍由 Slurm 调度决定。若预处理已完成，且成功记录、报告和文件校验均通过，则直接提交试跑，不再依赖可能已从 Slurm 缓存中清除的旧作业。
+
+自动选秩采用以下固定策略：在准备报告包含的候选秩中，选出满足**验证集平均相对 L2 误差不超过 0.05，最大相对 L2 误差不超过 0.20**的最小秩。没有任何候选满足时停止，不自动放宽阈值。两项阈值只是用于试跑的可调整工程门槛，不证明科研精度达标；仍需检查各速度分量、锚点重叠和物理重建指标。只根据训练／验证信息选择，测试集不参与选秩。
+
+需要改变门槛时，在上述命令中明确增加 `--rank-mean-limit` 和 `--rank-max-limit`，例如 `--rank-mean-limit 0.03 --rank-max-limit 0.15`。策略写入不可变的训练计划；首次开始时会记录 `rank_selection.json`，包含所选秩以及预处理成功记录、报告和 artifact 的 SHA256。所有子任务校验并使用同一个选择，后续恢复不能更改策略或替换 artifact。
+
+自动试跑固定为三个架构 × 粒子数 2、24、96 × 种子 31，共 9 个训练任务，默认每组 10 epochs。每个子任务申请一张 GH200，默认最多同时运行 4 个，每个任务限时 8 小时。因此可以只看到一个数组主编号；用下面的命令展开查看各子任务，`0` 至 `8` 是九个独立实验：
+
+```bash
+squeue -r -u "$USER"
+```
+
+预处理失败或被取消时，后续数组不会开始训练。脚本设置 `--kill-on-invalid-dep=yes`，请求 Slurm 在依赖已不可能满足时自动取消后续数组；检查状态时也可能看到 `DependencyNeverSatisfied`。修复预处理后，需要针对新的成功预处理提交衔接计划。若只有试跑子任务失败，应使用本页的 `matrix-resume --plan "$TRAINING_PLAN"` 恢复原试跑计划，并通过 `FLOW3D_ARRAY_TASKS` 指定失败编号；不要再次运行 `matrix-followup`，否则会创建另一批独立试跑。
+
 ## 试跑与正式训练
+
+若已提交上一节的自动衔接，跳过下面两条手动 `--phase pilot` 命令，避免重复训练。自动试跑完成后，用实际自动试跑计划路径替换下面示例，读取其已选定的 artifact，再检查结果并执行本节的 `--phase full` 命令：
+
+```bash
+export TRAINING_PLAN=/work/hdd/biup/zguan2/results/matrices/实际自动试跑计划/plan.json
+TENSOR_ARTIFACT=$(python -c 'import json, pathlib, sys; p = pathlib.Path(sys.argv[1]).parent / "rank_selection.json"; print(json.loads(p.read_text(encoding="utf-8"))["artifact"]["path"])' "$TRAINING_PLAN") &&
+export TENSOR_ARTIFACT
+```
 
 把准备阶段实际输出目录填入变量。以下路径中的 `实际准备目录` 必须替换；`rank_8.pt` 只是示例，不是已经选定的秩。
 
@@ -97,7 +147,7 @@ tail -n 60 /work/hdd/biup/zguan2/logs/JOB_ID_0.err
   logs/<数组编号>_<任务编号>.err          Slurm 标准错误
 ```
 
-`plan.json` 保存 manifest 内容与 SHA256、tensor artifact 的 SHA256，任务启动前再次核对。修改数据 manifest、替换 artifact 或使用别的代码快照会被拒绝。底层训练器继续校验科学数据划分及 checkpoint 兼容性。
+`plan.json` 保存 manifest 内容与 SHA256，以及手动选定的 tensor artifact 的 SHA256，任务启动前再次核对。自动衔接计划先固定预处理计划和选秩策略，artifact 尚未生成时不预填其 SHA256；成功准备后的选择及 artifact SHA256 固定在同目录的 `rank_selection.json` 中，所有子任务再次核对。修改数据 manifest、替换 artifact 或使用别的代码快照会被拒绝。底层训练器继续校验科学数据划分及 checkpoint 兼容性。
 
 ## 评估
 
