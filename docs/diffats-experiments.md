@@ -2,6 +2,10 @@
 
 现有 1000 个流场可以复用，不重新运行 Taichi。本流程在 DeltaAI 的 ARM/GH200 节点上使用站点 PyTorch，所有压缩准备、训练和评估均通过 Slurm。登录节点只同步代码、生成任务计划及提交作业。
 
+也支持 [Delta A100 两小时时限的完整矩阵](delta-matrix.md)。该配置复用已有
+x86_64 PyTorch 环境及共享数据，默认最多 16 个任务并发。下文未特别注明的
+资源参数和登录示例仍对应 DeltaAI/GH200；计划固定执行集群，续训时不能换集群。
+
 ## 实验矩阵
 
 三种架构：现有 `unet3d`、直接处理完整三维场的 `dit3d`、对齐 Tucker 表示的 `tensor-dit`。后两者的默认 Transformer 宽度 192、深度 4、注意力头 6；完整三维 DiT 的 patch 大小为 4。不同架构的参数量与耗时应实际报告，不能把架构变化的收益都归结为降维。
@@ -53,9 +57,9 @@ bash scripts/submit.sh tensor-prepare --ranks 4,8,12,16
 
 终端打印 `计划：.../plan.json` 和 Slurm JOB_ID。压缩输出目录记录在该计划的 `prepare_output` 字段；完成后里面有 `report.json` 与 `rank_4.pt`、`rank_8.pt`、`rank_12.pt`、`rank_16.pt`。查看报告的验证误差、各速度分量及物理重建指标后，再选一个秩；不要默认认为更高压缩比更好。锚点重叠与近似重建误差需要一起检查。
 
-## 当前预处理自动衔接 9 组试跑
+## 当前预处理自动衔接后续训练
 
-已经提交的 `tensor-prepare` 只有一个计算任务，它依次准备各秩的缓存，不包含 63 组训练。可以现在另提交一个有依赖的试跑数组：预处理成功后自动选秩，再开始 9 个独立训练子任务，无需重新运行预处理，也无需保持 SSH 在线。正式 63 组训练仍需要检查试跑结果后手动提交。
+已经提交的 `tensor-prepare` 只有一个计算任务，它依次准备各秩的缓存，不包含 63 组训练。可以另提交一个后续训练数组：预处理成功后自动选秩，再开始独立训练子任务，无需重新运行预处理，也无需保持 SSH 在线。`matrix-followup --phase full` 直接提交正式 63 组训练；`--phase pilot` 提交 9 组试跑，省略 `--phase` 时仍默认为 pilot。两种阶段择一提交，不会从 pilot 自动升级为 full。
 
 先在 DeltaAI 的 `gh-login...` 窗口更新代码并加载配置；`uname -m` 应为 `aarch64`：
 
@@ -75,29 +79,29 @@ export PREPARE_PLAN=/work/hdd/biup/zguan2/results/matrices/实际预处理计划
 export PREPARE_JOB_ID=1234567
 
 bash scripts/submit.sh matrix-followup \
-  --prepare-plan "$PREPARE_PLAN" --after-job "$PREPARE_JOB_ID" --dry-run
+  --prepare-plan "$PREPARE_PLAN" --after-job "$PREPARE_JOB_ID" --phase full --dry-run
 
 bash scripts/submit.sh matrix-followup \
-  --prepare-plan "$PREPARE_PLAN" --after-job "$PREPARE_JOB_ID"
+  --prepare-plan "$PREPARE_PLAN" --after-job "$PREPARE_JOB_ID" --phase full
 ```
 
-正式命令仅执行一次，并保存它打印的新训练计划路径和数组编号。该命令不会修改已有的预处理作业。预处理尚未完成时，新数组设置 `afterok` 依赖：提交后就进入队列等待，预处理成功退出后才满足依赖条件，是否立即获得 GH200 仍由 Slurm 调度决定。若预处理已完成，且成功记录、报告和文件校验均通过，则直接提交试跑，不再依赖可能已从 Slurm 缓存中清除的旧作业。
+上面两条命令采用 full；如需先试跑，将两处 `--phase full` 改为 `--phase pilot`。去掉 `--dry-run` 的提交命令仅执行一次，并保存它打印的新训练计划路径和数组编号。该命令不会修改已有的预处理作业。预处理尚未完成时，新数组设置 `afterok` 依赖：提交后就进入队列等待，预处理成功退出后才满足依赖条件，是否立即获得 GH200 仍由 Slurm 调度决定。若预处理已完成，且成功记录、报告和文件校验均通过，则直接提交选定阶段，不再依赖可能已从 Slurm 缓存中清除的旧作业。
 
-自动选秩采用以下固定策略：在准备报告包含的候选秩中，选出满足**验证集平均相对 L2 误差不超过 0.05，最大相对 L2 误差不超过 0.20**的最小秩。没有任何候选满足时停止，不自动放宽阈值。两项阈值只是用于试跑的可调整工程门槛，不证明科研精度达标；仍需检查各速度分量、锚点重叠和物理重建指标。只根据训练／验证信息选择，测试集不参与选秩。
+自动选秩采用以下固定策略：在准备报告包含的候选秩中，选出满足**验证集平均相对 L2 误差不超过 0.05，最大相对 L2 误差不超过 0.20**的最小秩。没有任何候选满足时停止，不自动放宽阈值。两项阈值是可调整的工程门槛，不证明科研精度达标；仍需检查各速度分量、锚点重叠和物理重建指标。只根据训练／验证信息选择，测试集不参与选秩。
 
 需要改变门槛时，在上述命令中明确增加 `--rank-mean-limit` 和 `--rank-max-limit`，例如 `--rank-mean-limit 0.03 --rank-max-limit 0.15`。策略写入不可变的训练计划；首次开始时会记录 `rank_selection.json`，包含所选秩以及预处理成功记录、报告和 artifact 的 SHA256。所有子任务校验并使用同一个选择，后续恢复不能更改策略或替换 artifact。
 
-自动试跑固定为三个架构 × 粒子数 2、24、96 × 种子 31，共 9 个训练任务，默认每组 10 epochs。每个子任务申请一张 GH200，默认最多同时运行 4 个，每个任务限时 8 小时。因此可以只看到一个数组主编号；用下面的命令展开查看各子任务，`0` 至 `8` 是九个独立实验：
+full 为三个架构 × 粒子数 2、4、6、12、24、48、96 × 种子 31、32、33，共 63 个训练任务，每组 100 epochs。pilot 为三个架构 × 粒子数 2、24、96 × 种子 31，共 9 个任务，每组 10 epochs。两者都只使用一个自动选定的秩。每个子任务申请一张 GH200，默认最多同时运行 4 个，每个任务限时 8 小时。因此可以只看到一个数组主编号；用下面的命令展开查看各子任务，full 编号为 `0` 至 `62`，pilot 为 `0` 至 `8`：
 
 ```bash
 squeue -r -u "$USER"
 ```
 
-预处理失败或被取消时，后续数组不会开始训练。脚本设置 `--kill-on-invalid-dep=yes`，请求 Slurm 在依赖已不可能满足时自动取消后续数组；检查状态时也可能看到 `DependencyNeverSatisfied`。修复预处理后，需要针对新的成功预处理提交衔接计划。若只有试跑子任务失败，应使用本页的 `matrix-resume --plan "$TRAINING_PLAN"` 恢复原试跑计划，并通过 `FLOW3D_ARRAY_TASKS` 指定失败编号；不要再次运行 `matrix-followup`，否则会创建另一批独立试跑。
+预处理失败或被取消时，后续数组不会开始训练。脚本设置 `--kill-on-invalid-dep=yes`，请求 Slurm 在依赖已不可能满足时自动取消后续数组；检查状态时也可能看到 `DependencyNeverSatisfied`。修复预处理后，需要针对新的成功预处理提交衔接计划。若只有训练子任务失败，应使用本页的 `matrix-resume --plan "$TRAINING_PLAN"` 恢复原训练计划，并通过 `FLOW3D_ARRAY_TASKS` 指定失败编号；不要再次运行 `matrix-followup`，否则会创建另一批独立训练。
 
 ## 试跑与正式训练
 
-若已提交上一节的自动衔接，跳过下面两条手动 `--phase pilot` 命令，避免重复训练。自动试跑完成后，用实际自动试跑计划路径替换下面示例，读取其已选定的 artifact，再检查结果并执行本节的 `--phase full` 命令：
+若已自动衔接 full，跳过本节的全部训练提交命令，避免重复提交 63 组。若已自动衔接 pilot，跳过下面两条手动 `--phase pilot` 命令；自动试跑完成后，用实际自动试跑计划路径替换下面示例，读取其已选定的 artifact，再检查结果并执行本节的 `--phase full` 命令：
 
 ```bash
 export TRAINING_PLAN=/work/hdd/biup/zguan2/results/matrices/实际自动试跑计划/plan.json
@@ -113,7 +117,7 @@ bash scripts/submit.sh matrix-train --phase pilot --tensor-artifact "$TENSOR_ART
 bash scripts/submit.sh matrix-train --phase pilot --tensor-artifact "$TENSOR_ARTIFACT"
 ```
 
-9 个试跑任务完成并检查损失、有限值、显存和耗时后，提交正式矩阵：
+手动指定 artifact 后，也可直接提交正式矩阵；若选择先试跑，则在 9 个试跑任务完成并检查损失、有限值、显存和耗时后执行：
 
 ```bash
 export FLOW3D_ARRAY_CONCURRENCY=4

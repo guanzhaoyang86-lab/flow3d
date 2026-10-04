@@ -215,9 +215,12 @@ def _load_submission_fixture():
     return module
 
 
-@pytest.mark.parametrize("mode,dependency", [("matrix-train", ""), ("matrix-followup", "12345"),
-                                             ("matrix-followup", "")])
-def test_slurm_array_reuses_one_snapshot_and_preserves_dry_run(tmp_path, mode, dependency):
+@pytest.mark.parametrize("mode,dependency,phase", [("matrix-train", "", None),
+                                                  ("matrix-followup", "12345", None),
+                                                  ("matrix-followup", "", None),
+                                                  ("matrix-followup", "", "full")])
+@pytest.mark.parametrize("cluster", ["deltaai", "delta"])
+def test_slurm_array_reuses_one_snapshot_and_preserves_dry_run(tmp_path, mode, dependency, phase, cluster):
     """Real local Git snapshots + mocked planner/sbatch; no network/GPU."""
     fixture = _load_submission_fixture()
     if not fixture.BASH or not fixture.GIT:
@@ -225,13 +228,18 @@ def test_slurm_array_reuses_one_snapshot_and_preserves_dry_run(tmp_path, mode, d
     case = fixture.SubmissionTests()
     case.setUp()
     try:
+        account, partition, arch, time_limit, concurrency = (
+            ("biup-dtai-gh", "ghx4", "aarch64", "08:00:00", 4) if cluster == "deltaai" else
+            ("biup-delta-gpu", "gpuA100x4", "x86_64", "02:00:00", 16))
+        case.env.pop("FLOW3D_TRAIN_TIME", None)
+        case.env["FLOW3D_ARRAY_CONCURRENCY"] = str(concurrency)
         shutil.copytree(case.publisher / "scripts", case.publisher / "project/scripts")
         (case.publisher / "scripts/run_hpc_matrix.py").write_text("# mocked by python shim\n")
         common = case.publisher / "project/scripts/common.sh"
         with common.open("a", newline="\n") as stream:
             stream.write('\nflow3d_settings() {\n'
-                         'export FLOW3D_CLUSTER=deltaai FLOW3D_ACCOUNT=biup-dtai-gh\n'
-                         'export FLOW3D_PARTITION=ghx4 FLOW3D_GPUS=1 FLOW3D_CPUS=8 FLOW3D_MEM=64G\n'
+                         f'export FLOW3D_CLUSTER={cluster} FLOW3D_ACCOUNT={account}\n'
+                         f'export FLOW3D_PARTITION={partition} FLOW3D_GPUS=1 FLOW3D_CPUS=8 FLOW3D_MEM=32G\n'
                          'mkdir -p "$FLOW3D_ROOT/logs"\n}\n')
         case.write_script(case.root / "bin/python", '#!/bin/bash\n'
                           'case "$2" in\n'
@@ -246,36 +254,99 @@ def test_slurm_array_reuses_one_snapshot_and_preserves_dry_run(tmp_path, mode, d
                           'check-time) exit 0 ;;\n'
                           '*) exit 3 ;;\n'
                           'esac\n')
-        count = 9 if mode == "matrix-followup" else 63
+        count = 9 if mode == "matrix-followup" and phase != "full" else 63
+        arguments = ["--phase", phase] if phase else []
         case.env.update(MOCK_MATRIX_COUNT=str(count), MOCK_MATRIX_DEPENDENCY=dependency)
-        case.write_script(case.root / "bin/uname", '#!/bin/bash\necho x86_64\n')
+        wrong_arch = "x86_64" if arch == "aarch64" else "aarch64"
+        case.write_script(case.root / "bin/uname", f'#!/bin/bash\necho {wrong_arch}\n')
         case.commit(case.publisher, "matrix fixture")
         case.git("push", cwd=case.publisher)
         case.git("pull", "--ff-only", cwd=case.repo)
-        result = case.submit("project/scripts/submit.sh", mode, ["--dry-run"])
+        result = case.submit("project/scripts/submit.sh", mode, [*arguments, "--dry-run"])
         assert result.returncode == 0, result.stdout + result.stderr
         assert not case.capture.exists()
         assert not (case.root / "snapshots").exists()
-        result = case.submit("project/scripts/submit.sh", mode, [])
+        result = case.submit("project/scripts/submit.sh", mode, arguments)
         assert result.returncode != 0
-        assert "DeltaAI" in result.stderr
+        assert ("DeltaAI" if cluster == "deltaai" else "dt-login") in result.stderr
         assert not case.capture.exists()
         assert not (case.root / "snapshots").exists()
-        case.write_script(case.root / "bin/uname", '#!/bin/bash\necho aarch64\n')
-        result = case.submit("project/scripts/submit.sh", mode, [])
+        case.write_script(case.root / "bin/uname", f'#!/bin/bash\necho {arch}\n')
+        result = case.submit("project/scripts/submit.sh", mode, arguments)
         assert result.returncode == 0, result.stdout + result.stderr
+        assert f"总任务：{count}" in result.stdout
         options = case.capture.read_bytes().decode().rstrip("\0").split("\0")
-        assert f"--array=0-{count - 1}%4" in options
+        assert f"--array=0-{count - 1}%{concurrency}" in options
         if dependency:
             assert f"--dependency=afterok:{dependency}" in options
             assert "--kill-on-invalid-dep=yes" in options
         else:
             assert not any(option.startswith("--dependency") for option in options)
         assert "--gpus-per-node=1" in options
-        assert "--account=biup-dtai-gh" in options
-        assert "--partition=ghx4" in options
-        assert "--time=08:00:00" in options
+        assert f"--account={account}" in options
+        assert f"--partition={partition}" in options
+        assert f"--time={time_limit}" in options
         assert any("%A_%a.out" in option for option in options)
         assert len(list((case.root / "snapshots").iterdir())) == 1
     finally:
         case.tearDown()
+
+
+def test_delta_plan_reuses_cache_but_keeps_results_independent(tmp_path):
+    args = plan_args(tmp_path, cluster="deltaai")
+    gh = matrix.read_plan(matrix.make_plan(args))
+    args.cluster = "delta"
+    a100 = matrix.read_plan(matrix.make_plan(args))
+    assert gh["cluster"] == "deltaai" and a100["cluster"] == "delta"
+    assert gh["manifest"] == a100["manifest"]
+    assert gh["tensor_artifact"] == a100["tensor_artifact"]
+    assert gh["train_options"] == a100["train_options"]
+    assert a100["epochs"] == 100 and len(a100["tasks"]) == 63
+    for left, right in zip(gh["tasks"], a100["tasks"]):
+        assert left["key"] == right["key"]
+        assert left["record_dir"] != right["record_dir"]
+        assert left["checkpoint_dir"] != right["checkpoint_dir"]
+
+
+@pytest.mark.parametrize("document,cluster,architecture,gpu", [
+    ({}, "deltaai", "aarch64", "NVIDIA GH200 120GB"),
+    ({"cluster": "deltaai"}, "deltaai", "aarch64", "NVIDIA GH200 120GB"),
+    ({"cluster": "delta"}, "delta", "x86_64", "NVIDIA A100-SXM4-40GB"),
+])
+def test_cluster_hardware_accepts_matching_gpu(document, cluster, architecture, gpu):
+    matrix.validate_hardware(document, cluster=cluster, architecture=architecture, gpu=gpu)
+
+
+@pytest.mark.parametrize("document,cluster,architecture,gpu", [
+    ({}, "delta", "x86_64", "NVIDIA A100-SXM4-40GB"),  # old plans remain GH200
+    ({"cluster": "delta"}, "deltaai", "aarch64", "NVIDIA GH200 120GB"),
+    ({"cluster": "delta"}, "delta", "aarch64", "NVIDIA A100-SXM4-40GB"),
+    ({"cluster": "delta"}, "delta", "x86_64", "NVIDIA A40"),
+    ({"cluster": "deltaai"}, "deltaai", "x86_64", "NVIDIA GH200 120GB"),
+    ({"cluster": "unknown"}, "unknown", "x86_64", "NVIDIA A100-SXM4-40GB"),
+])
+def test_cluster_hardware_rejects_wrong_profile_or_gpu(document, cluster, architecture, gpu):
+    with pytest.raises(ValueError):
+        matrix.validate_hardware(document, cluster=cluster, architecture=architecture, gpu=gpu)
+
+
+def test_resume_cannot_silently_migrate_a_plan_to_another_cluster(tmp_path):
+    path = matrix.make_plan(plan_args(tmp_path, cluster="deltaai", dry_run=False))
+    env = {**os.environ, "FLOW3D_CLUSTER": "delta"}
+    result = subprocess.run([sys.executable, str(ROOT / "scripts/run_hpc_matrix.py"),
+                             "resume", "--plan", str(path)], env=env, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "requires deltaai profile" in result.stderr
+
+
+def test_inspect_reuses_exact_selected_artifact_and_rejects_tampering(tmp_path):
+    args = plan_args(tmp_path)
+    path = matrix.make_plan(args)
+    command = [sys.executable, str(ROOT / "scripts/run_hpc_matrix.py"),
+               "inspect", "--plan", str(path), "--field", "tensor_artifact"]
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert Path(result.stdout.strip()) == args.tensor_artifact.resolve()
+    args.tensor_artifact.write_bytes(b"modified cache")
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode != 0 and "changed" in result.stderr

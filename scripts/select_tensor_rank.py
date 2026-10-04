@@ -4,7 +4,7 @@
 This standard-library-only helper reads preparation reports without loading
 tensors or touching a GPU. It does not verify artifact bytes; the HPC runner
 pins and verifies the successful preparation record, report and artifact hashes.
-The limits are pilot engineering gates, not claims of scientific accuracy.
+The limits are configurable reconstruction gates, not claims of scientific accuracy.
 """
 
 from __future__ import annotations

@@ -117,8 +117,9 @@ def test_followup_rejects_unsubmitted_or_wrong_source_plan(prepared, change, exp
 
 
 @pytest.mark.parametrize("field,value,expected", [
+    ("cluster", "delta", "requires deltaai profile"),
     ("storage_root", "other-root", "storage root"),
-    ("phase", "full", "pilot only"),
+    ("phase", "invalid", "pilot or full"),
     ("tensor_artifact", "rank_8.pt", "automatically"),
     ("rank_mean_limit", float("nan"), "finite"),
     ("rank_max_limit", .01, "must not exceed"),
@@ -157,6 +158,29 @@ def test_completed_followup_selects_once_and_drops_obsolete_slurm_dependency(pre
     assert matrix.followup_dependency(document, path) == ""
     assert selection_path.read_bytes() == before
     assert matrix.read_plan(path)["tensor_artifact"] is None
+
+
+@pytest.mark.parametrize("cluster", ["deltaai", "delta"])
+def test_full_followup_selects_rank_and_directly_builds_63_formal_runs(prepared, cluster):
+    prepared["args"].cluster = cluster
+    prepared["prepare"]["cluster"] = cluster
+    write_json(prepared["prepare_path"], prepared["prepare"])
+    prepared["args"].phase = "full"
+    path, document = followup(prepared)
+    completed = finish_preparation(prepared)
+    resolved = matrix.resolve_followup(document, path)
+    assert resolved["phase"] == "full" and resolved["epochs"] == 100
+    assert len(resolved["tasks"]) == 63
+    assert {task["num_particles"] for task in resolved["tasks"]} == {2, 4, 6, 12, 24, 48, 96}
+    assert {task["seed"] for task in resolved["tasks"]} == {31, 32, 33}
+    assert resolved["tensor_artifact"] == completed["artifacts"][1]
+    assert matrix.selected_array(resolved, "all") == "0-62"
+    assert matrix.followup_dependency(document, path) == ""
+    for task in resolved["tasks"]:
+        command = matrix.task_command(resolved, task)
+        assert command[command.index("--epochs") + 1] == "100"
+        if task["architecture"] == "tensor-dit":
+            assert command[command.index("--tensor-artifact") + 1] == completed["artifacts"][1]["path"]
 
 
 @pytest.mark.parametrize("kind", ["source-plan", "result-plan", "job", "report", "artifact",

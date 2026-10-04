@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Plan and execute reproducible single-GH200 Slurm experiment arrays.
+"""Plan and execute reproducible single-GPU DeltaAI/GH200 or Delta/A100 arrays.
 
 Planning uses the Python standard library only. GPU imports and computation
 occur exclusively in the `run` command, which requires a Slurm allocation.
@@ -27,6 +27,29 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 ARCHITECTURES = ("unet3d", "dit3d", "tensor-dit")
 COUNTS = (2, 4, 6, 12, 24, 48, 96)
 SEEDS = (31, 32, 33)
+CLUSTER_HARDWARE = {"deltaai": ("aarch64", "GH200"), "delta": ("x86_64", "A100")}
+
+
+def plan_cluster(document: dict) -> str:
+    # Plans published before cluster selection were exclusively DeltaAI/GH200.
+    cluster = document.get("cluster", "deltaai")
+    if cluster not in CLUSTER_HARDWARE:
+        raise ValueError(f"unsupported matrix cluster: {cluster}")
+    return cluster
+
+
+def require_plan_cluster(document: dict, actual: str) -> str:
+    expected = plan_cluster(document)
+    if actual != expected:
+        raise ValueError(f"plan requires {expected} profile, got {actual}; create a new plan to change cluster")
+    return expected
+
+
+def validate_hardware(document: dict, *, cluster: str, architecture: str, gpu: str) -> None:
+    expected = require_plan_cluster(document, cluster)
+    expected_arch, expected_gpu = CLUSTER_HARDWARE[expected]
+    if architecture != expected_arch or not re.search(rf"\b{expected_gpu}\b", gpu):
+        raise ValueError(f"{expected} matrix requires {expected_arch}/{expected_gpu}, got {architecture}/{gpu}")
 
 
 def digest(path: Path) -> str:
@@ -106,7 +129,7 @@ def validate_time(value: str) -> None:
     days, hours, minutes, seconds = (int(part or 0) for part in match.groups())
     total = ((days * 24 + hours) * 60 + minutes) * 60 + seconds
     if minutes >= 60 or seconds >= 60 or not 0 < total <= 48 * 3600:
-        raise ValueError("ghx4 time must be positive and at most 48:00:00")
+        raise ValueError("matrix time must be positive and at most 48:00:00")
 
 
 def resolve_followup(document: dict, plan_path: Path) -> dict:
@@ -192,6 +215,7 @@ def followup_dependency(document: dict, plan_path: Path) -> str:
 
 def make_plan(args: argparse.Namespace) -> Path:
     root = args.storage_root.expanduser().resolve()
+    cluster = plan_cluster({"cluster": getattr(args, "cluster", "deltaai")})
     if not re.fullmatch(r"[0-9a-f]{40,64}", args.commit):
         raise ValueError("a full Git commit is required")
     code_dir = args.code_dir.expanduser().resolve()
@@ -224,8 +248,8 @@ def make_plan(args: argparse.Namespace) -> Path:
             raise ValueError("matrix-followup requires --prepare-plan and --after-job")
         if args.tensor_artifact is not None:
             raise ValueError("matrix-followup selects its artifact automatically")
-        if args.phase not in (None, "pilot"):
-            raise ValueError("matrix-followup starts the 9-task pilot only")
+        if args.phase not in (None, "pilot", "full"):
+            raise ValueError("matrix-followup phase must be pilot or full")
         for limit in (args.rank_mean_limit, args.rank_max_limit):
             if not math.isfinite(limit) or limit <= 0:
                 raise ValueError("automatic rank limits must be finite and positive")
@@ -235,10 +259,13 @@ def make_plan(args: argparse.Namespace) -> Path:
         prepare = read_plan(prepare_path)
         if prepare["mode"] != "tensor-prepare" or prepare["dry_run"] or len(prepare["tasks"]) != 1:
             raise ValueError("follow-up requires a submitted single-task preparation plan")
+        # Slurm job IDs/dependencies are local to each independent cluster.
+        # Across clusters, reuse the completed artifact with matrix-train.
+        require_plan_cluster(prepare, cluster)
         if Path(prepare["storage_root"]).resolve() != root:
             raise ValueError("follow-up must use the preparation storage root")
         manifest = verify_identity(prepare["manifest"])
-        phase, effective_mode = "pilot", "matrix-train"
+        phase, effective_mode = args.phase or "pilot", "matrix-train"
         rows = training_rows(phase)
         followup = {"prepare_plan": identity(prepare_path), "prepare_commit": prepare["commit"],
                     "after_job": str(args.after_job),
@@ -264,7 +291,7 @@ def make_plan(args: argparse.Namespace) -> Path:
         if args.tensor_artifact is None:
             raise ValueError("choose a validated rank explicitly with --tensor-artifact rank_R.pt")
         artifact = identity(args.tensor_artifact)
-    plan_id = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S") + f"_{args.mode}_{uuid.uuid4().hex[:8]}"
+    plan_id = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S") + f"_{cluster}_{args.mode}_{uuid.uuid4().hex[:8]}"
     directory = root / "results" / "matrices" / plan_id
     for row in rows:
         row["record_dir"] = str(directory / "tasks" / f"{row['index']:03d}_{row['key']}")
@@ -272,7 +299,7 @@ def make_plan(args: argparse.Namespace) -> Path:
             row["checkpoint_dir"] = str(root / "checkpoints" / plan_id / row["key"])
     document = {
         "format_version": 1, "plan_id": plan_id, "mode": effective_mode,
-        "dry_run": args.dry_run, "commit": args.commit, "code_dir": str(code_dir),
+        "dry_run": args.dry_run, "commit": args.commit, "code_dir": str(code_dir), "cluster": cluster,
         "storage_root": str(root), "manifest": manifest_id, "split_sizes": split_sizes,
         "manifest_content": data, "tensor_artifact": artifact, "tasks": rows,
         "phase": phase or "full", "epochs": args.epochs or (10 if phase == "pilot" else 100),
@@ -286,6 +313,7 @@ def make_plan(args: argparse.Namespace) -> Path:
                        "eta": 1.0, "cfg_scale": 1.5, "boundary_projection": "final"},
         "training_plan": identity(args.training_plan) if training_plan else None,
         "training_commit": training_plan["commit"] if training_plan else None,
+        "training_cluster": plan_cluster(training_plan) if training_plan else None,
         "followup": followup,
         "training_rank_selection": training_plan.get("rank_selection") if training_plan else None,
     }
@@ -430,8 +458,7 @@ def run_task(args: argparse.Namespace) -> None:
     root = Path(document["storage_root"]).resolve()
     if not root.is_relative_to(Path("/work")):
         raise ValueError("GPU outputs must be under /work")
-    if os.environ.get("FLOW3D_CLUSTER") != "deltaai":
-        raise ValueError("matrix jobs require the DeltaAI profile")
+    cluster = require_plan_cluster(document, os.environ.get("FLOW3D_CLUSTER", ""))
     index = int(os.environ["SLURM_ARRAY_TASK_ID"])
     if index < 0 or index >= len(document["tasks"]):
         raise ValueError("invalid Slurm array index")
@@ -447,8 +474,7 @@ def run_task(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise ValueError("exactly one CUDA GPU is required")
     gpu = torch.cuda.get_device_name(0)
-    if platform.machine() != "aarch64" or "GH200" not in gpu:
-        raise ValueError(f"this matrix requires ARM/GH200, got {platform.machine()}/{gpu}")
+    validate_hardware(document, cluster=cluster, architecture=platform.machine(), gpu=gpu)
     record = Path(task["record_dir"])
     record.mkdir(parents=True, exist_ok=True)
     import fcntl
@@ -473,6 +499,7 @@ def run_task(args: argparse.Namespace) -> None:
             "commit": document["commit"], "python": platform.python_version(),
             "torch": torch.__version__, "cuda": torch.version.cuda, "gpu": gpu,
             "architecture": platform.machine(), "host": platform.node(),
+            "cluster": cluster, "slurm_cluster_name": os.environ.get("SLURM_CLUSTER_NAME"),
             "modules": os.environ.get("LOADEDMODULES"), "slurm_job_id": os.environ["SLURM_JOB_ID"],
             "slurm_array_job_id": os.environ.get("SLURM_ARRAY_JOB_ID"), "array_task_id": index,
             "account": os.environ.get("SLURM_JOB_ACCOUNT"), "partition": os.environ.get("SLURM_JOB_PARTITION"),
@@ -539,6 +566,7 @@ def main() -> None:
     plan.add_argument("--storage-root", type=Path, default=os.environ.get("FLOW3D_ROOT"), required=not os.environ.get("FLOW3D_ROOT"))
     plan.add_argument("--code-dir", type=Path, required=True)
     plan.add_argument("--commit", required=True)
+    plan.add_argument("--cluster", choices=tuple(CLUSTER_HARDWARE), default=os.environ.get("FLOW3D_CLUSTER", "deltaai"))
     plan.add_argument("--phase", choices=("pilot", "full"), default=None)
     plan.add_argument("--epochs", type=positive)
     plan.add_argument("--ranks", type=ranks, default=[4, 8, 12, 16])
@@ -548,7 +576,7 @@ def main() -> None:
     run.add_argument("--resume", action="store_true")
     inspect = subparsers.add_parser("inspect")
     inspect.add_argument("--plan", type=Path, required=True)
-    inspect.add_argument("--field", choices=("mode", "code_dir", "commit", "count", "sha256"), required=True)
+    inspect.add_argument("--field", choices=("mode", "code_dir", "commit", "count", "sha256", "cluster", "tensor_artifact"), required=True)
     array = subparsers.add_parser("array")
     array.add_argument("--plan", type=Path, required=True)
     array.add_argument("--tasks", default="all")
@@ -570,14 +598,23 @@ def main() -> None:
             run_task(args)
         elif args.action == "inspect":
             document = read_plan(args.plan)
-            print(digest(args.plan) if args.field == "sha256" else
-                  len(document["tasks"]) if args.field == "count" else document[args.field])
+            if args.field == "tensor_artifact":
+                document = resolve_followup(document, args.plan)
+                verify_identity(document["manifest"])
+                if not document.get("tensor_artifact"):
+                    raise ValueError("plan has no prepared tensor artifact")
+                print(verify_identity(document["tensor_artifact"]))
+            else:
+                print(digest(args.plan) if args.field == "sha256" else
+                      plan_cluster(document) if args.field == "cluster" else
+                      len(document["tasks"]) if args.field == "count" else document[args.field])
         elif args.action == "array":
             print(selected_array(read_plan(args.plan), args.tasks))
         elif args.action == "dependency":
             print(followup_dependency(read_plan(args.plan), args.plan))
         elif args.action == "resume":
             document = read_plan(args.plan)
+            require_plan_cluster(document, os.environ.get("FLOW3D_CLUSTER", "deltaai"))
             if document["dry_run"] or document["mode"] == "tensor-prepare":
                 raise ValueError("only submitted training/evaluation plans support resume")
             marker = Path(document["code_dir"]) / ".flow3d-commit"

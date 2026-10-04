@@ -7,12 +7,20 @@ mode="${1:?缺少矩阵模式}"; shift
 dry_run=0
 for argument in "$@"; do [[ "$argument" != --dry-run ]] || dry_run=1; done
 flow3d_settings
-[[ "$FLOW3D_CLUSTER" = deltaai && "$FLOW3D_GPUS" = 1 ]] || flow3d_die '请 source configs/deltaai-matrix.env.example；每个任务使用一张 GH200'
+[[ "$FLOW3D_GPUS" = 1 ]] || flow3d_die '矩阵任务必须使用单 GPU；请加载 deltaai-matrix 或 delta-matrix 配置'
+case "$FLOW3D_CLUSTER" in
+    deltaai) expected_arch=aarch64; cluster_label='DeltaAI（gh-login...，aarch64）'; default_train_time=08:00:00 ;;
+    delta)
+        expected_arch=x86_64; cluster_label='Delta（dt-login...，x86_64）'; default_train_time=02:00:00
+        [[ "$FLOW3D_PARTITION" = gpuA100x4 || "$FLOW3D_PARTITION" = gpuA100x8 ]] || flow3d_die 'Delta 矩阵目前只支持 A100 分区'
+        ;;
+    *) flow3d_die '矩阵任务只支持 DeltaAI/GH200 或 Delta/A100' ;;
+esac
 concurrency="${FLOW3D_ARRAY_CONCURRENCY:-4}"
 [[ "$concurrency" =~ ^[1-9][0-9]*$ ]] || flow3d_die 'FLOW3D_ARRAY_CONCURRENCY 必须为正整数'
 command -v python >/dev/null || flow3d_die '请先加载站点 Python 模块'
 if (( ! dry_run )); then
-    [[ "$(uname -m)" = aarch64 ]] || flow3d_die '请登录 DeltaAI（gh-login...，aarch64）提交 GH200 任务'
+    [[ "$(uname -m)" = "$expected_arch" ]] || flow3d_die "请登录 $cluster_label 提交当前配置的任务"
     command -v sbatch >/dev/null || flow3d_die '请在 NCSA 登录节点提交'
 fi
 if [[ "$mode" = matrix-resume ]]; then
@@ -28,7 +36,7 @@ else
         FLOW3D_CODE_DIR=$(bash "$code_dir/scripts/prepare_run.sh")
         FLOW3D_COMMIT=$(cat "$FLOW3D_CODE_DIR/.flow3d-commit")
     fi
-    plan=$(python "$FLOW3D_CODE_DIR/../scripts/run_hpc_matrix.py" plan "$mode" "$@" --code-dir "$FLOW3D_CODE_DIR" --commit "$FLOW3D_COMMIT")
+    plan=$(python "$FLOW3D_CODE_DIR/../scripts/run_hpc_matrix.py" plan "$mode" "$@" --code-dir "$FLOW3D_CODE_DIR" --commit "$FLOW3D_COMMIT" --cluster "$FLOW3D_CLUSTER")
 fi
 export FLOW3D_CODE_DIR FLOW3D_COMMIT
 runner="$FLOW3D_CODE_DIR/../scripts/run_hpc_matrix.py"
@@ -38,7 +46,7 @@ count=$(python "$runner" inspect --plan "$plan" --field count)
 actual_mode=$(python "$runner" inspect --plan "$plan" --field mode)
 case "$actual_mode" in
     tensor-prepare) time_limit="${FLOW3D_PREPARE_TIME:-02:00:00}" ;;
-    matrix-train) time_limit="${FLOW3D_TRAIN_TIME:-08:00:00}" ;;
+    matrix-train) time_limit="${FLOW3D_TRAIN_TIME:-$default_train_time}" ;;
     matrix-evaluate) time_limit="${FLOW3D_EVALUATE_TIME:-08:00:00}" ;;
     *) flow3d_die '无效的计划模式' ;;
 esac
@@ -55,9 +63,9 @@ if [[ "$mode" = matrix-followup ]]; then
     dependency=$(python "$runner" dependency --plan "$plan")
     if [[ -n "$dependency" ]]; then
         options+=(--dependency="afterok:$dependency" --kill-on-invalid-dep=yes)
-        printf '等待预处理作业 %s 成功后自动进入 9 组试跑。\n' "$dependency"
+        printf '等待预处理作业 %s 成功后自动进入 %s 组训练。\n' "$dependency" "$count"
     else
-        printf '预处理成功记录已验证，直接排队 9 组试跑。\n'
+        printf '预处理成功记录已验证，直接排队 %s 组训练。\n' "$count"
     fi
 fi
 printf -v FLOW3D_SUBMIT_COMMAND '%q ' sbatch "${options[@]}" "$FLOW3D_CODE_DIR/scripts/matrix.slurm" "${run_args[@]}"
