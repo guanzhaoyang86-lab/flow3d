@@ -234,6 +234,9 @@ def test_evaluation_resolves_deferred_training_artifact_and_rejects_inconsistent
         checkpoint.write_bytes(b"dummy trained weights")
         write_json(Path(task["record_dir"]) / "results.json", {
             "status": "completed", "best_checkpoint": matrix.identity(checkpoint),
+            "plan_sha256": matrix.digest(path), "task": task, "manifest": document["manifest"],
+            "training": {"status": "completed", "epochs": document["epochs"], "scientific_result": True,
+                         "architecture": task["architecture"], "num_particles_per_condition": task["num_particles"]},
             "tensor_artifact": completed["artifacts"][1],
         })
     args = argparse.Namespace(**{**vars(prepared["args"]), "mode": "matrix-evaluate", "training_plan": path})

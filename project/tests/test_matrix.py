@@ -103,7 +103,10 @@ def test_evaluation_requires_all_training_complete_and_pins_checkpoints(tmp_path
         record = Path(task["record_dir"])
         record.mkdir(parents=True)
         (record / "results.json").write_text(json.dumps({"status": "completed",
-                                                        "best_checkpoint": matrix.identity(checkpoint)}))
+            "plan_sha256": matrix.digest(training_path), "task": task, "manifest": training["manifest"],
+            "training": {"status": "completed", "epochs": training["epochs"], "scientific_result": True,
+                         "architecture": task["architecture"], "num_particles_per_condition": task["num_particles"]},
+            "best_checkpoint": matrix.identity(checkpoint)}))
     evaluation = matrix.read_plan(matrix.make_plan(evaluation_args))
     command = matrix.task_command(evaluation, evaluation["tasks"][0])
     assert command[command.index("--num-test-cases") + 1] == "101"
@@ -216,6 +219,7 @@ def _load_submission_fixture():
 
 
 @pytest.mark.parametrize("mode,dependency,phase", [("matrix-train", "", None),
+                                                  ("matrix-evaluate", "", None),
                                                   ("matrix-followup", "12345", None),
                                                   ("matrix-followup", "", None),
                                                   ("matrix-followup", "", "full")])
@@ -232,6 +236,9 @@ def test_slurm_array_reuses_one_snapshot_and_preserves_dry_run(tmp_path, mode, d
             ("biup-dtai-gh", "ghx4", "aarch64", "08:00:00", 4) if cluster == "deltaai" else
             ("biup-delta-gpu", "gpuA100x4", "x86_64", "02:00:00", 16))
         case.env.pop("FLOW3D_TRAIN_TIME", None)
+        if mode == "matrix-evaluate":
+            time_limit = "01:30:00"
+            case.env["FLOW3D_EVALUATE_TIME"] = time_limit
         case.env["FLOW3D_ARRAY_CONCURRENCY"] = str(concurrency)
         shutil.copytree(case.publisher / "scripts", case.publisher / "project/scripts")
         (case.publisher / "scripts/run_hpc_matrix.py").write_text("# mocked by python shim\n")
@@ -246,17 +253,19 @@ def test_slurm_array_reuses_one_snapshot_and_preserves_dry_run(tmp_path, mode, d
                           'plan) printf "%s/plan.json\\n" "$FLOW3D_ROOT" ;;\n'
                           'inspect) case "${6}" in\n'
                           'count) echo "$MOCK_MATRIX_COUNT" ;;\n'
-                          'mode) echo matrix-train ;;\n'
+                          'mode) echo "$MOCK_MATRIX_MODE" ;;\n'
                           'sha256) echo 0123456789abcdef ;;\n'
                           'esac ;;\n'
                           'array) echo "0-$((MOCK_MATRIX_COUNT - 1))" ;;\n'
                           'dependency) printf "%s\\n" "$MOCK_MATRIX_DEPENDENCY" ;;\n'
                           'check-time) exit 0 ;;\n'
+                          'time-budget) echo 5100 ;;\n'
                           '*) exit 3 ;;\n'
                           'esac\n')
-        count = 9 if mode == "matrix-followup" and phase != "full" else 63
+        count = 12 if mode == "matrix-evaluate" else 9 if mode == "matrix-followup" and phase != "full" else 63
         arguments = ["--phase", phase] if phase else []
         case.env.update(MOCK_MATRIX_COUNT=str(count), MOCK_MATRIX_DEPENDENCY=dependency)
+        case.env["MOCK_MATRIX_MODE"] = "matrix-evaluate" if mode == "matrix-evaluate" else "matrix-train"
         wrong_arch = "x86_64" if arch == "aarch64" else "aarch64"
         case.write_script(case.root / "bin/uname", f'#!/bin/bash\necho {wrong_arch}\n')
         case.commit(case.publisher, "matrix fixture")

@@ -18,6 +18,7 @@ from pathlib import Path
 import platform
 import re
 import statistics
+import subprocess
 import sys
 import tempfile
 import time
@@ -122,7 +123,7 @@ def selected_array(document: dict, selection: str) -> str:
     return ",".join(str(index) for index in indices)
 
 
-def validate_time(value: str) -> None:
+def validate_time(value: str) -> int:
     match = re.fullmatch(r"(?:(\d+)-)?(\d+):(\d{2}):(\d{2})", value)
     if not match:
         raise ValueError("time must be HH:MM:SS or D-HH:MM:SS")
@@ -130,6 +131,7 @@ def validate_time(value: str) -> None:
     total = ((days * 24 + hours) * 60 + minutes) * 60 + seconds
     if minutes >= 60 or seconds >= 60 or not 0 < total <= 48 * 3600:
         raise ValueError("matrix time must be positive and at most 48:00:00")
+    return total
 
 
 def resolve_followup(document: dict, plan_path: Path) -> dict:
@@ -221,6 +223,7 @@ def make_plan(args: argparse.Namespace) -> Path:
     code_dir = args.code_dir.expanduser().resolve()
     training_plan = None
     followup = None
+    training_selection = None
     effective_mode = args.mode
     phase = args.phase
     if args.mode == "matrix-evaluate":
@@ -230,19 +233,57 @@ def make_plan(args: argparse.Namespace) -> Path:
         if training_plan["mode"] != "matrix-train" or training_plan["dry_run"]:
             raise ValueError("evaluation requires a submitted training plan")
         training_plan = resolve_followup(training_plan, args.training_plan)
+        training_plan_sha256 = digest(args.training_plan)
         manifest = verify_identity(training_plan["manifest"])
+        requested = getattr(args, "training_tasks", "all")
+        if requested not in ("all", "completed"):
+            selected_array(training_plan, requested)
+            requested_ids = {int(value) for value in requested.split(",")}
+        else:
+            requested_ids = {task["index"] for task in training_plan["tasks"]}
+        excluded = []
         rows = []
         for training_task in training_plan["tasks"]:
+            if training_task["index"] not in requested_ids:
+                excluded.append({"index": training_task["index"], "key": training_task["key"], "reason": "not_requested"})
+                continue
             result_path = Path(training_task["record_dir"]) / "results.json"
+            if requested == "completed" and not result_path.is_file():
+                excluded.append({"index": training_task["index"], "key": training_task["key"], "reason": "no_result_record"})
+                continue
             result = json.loads(result_path.read_text(encoding="utf-8"))
             if result.get("status") != "completed":
+                if requested == "completed":
+                    excluded.append({"index": training_task["index"], "key": training_task["key"],
+                                     "reason": result.get("status", "unknown")})
+                    continue
                 raise ValueError(f"training not complete: {training_task['key']}")
+            if result.get("plan_sha256") != training_plan_sha256:
+                raise ValueError(f"training result belongs to a different plan: {training_task['key']}")
+            if result.get("task") != training_task or result.get("manifest") != training_plan["manifest"]:
+                raise ValueError(f"training result task/manifest mismatch: {training_task['key']}")
+            trained = result.get("training", {})
+            if (trained.get("status") != "completed" or trained.get("epochs") != training_plan["epochs"]
+                    or trained.get("architecture") != training_task["architecture"]
+                    or trained.get("num_particles_per_condition") != training_task["num_particles"]
+                    or trained.get("scientific_result") is not True):
+                raise ValueError(f"training summary incomplete or mismatched: {training_task['key']}")
             if training_plan.get("followup") and result.get("tensor_artifact") != training_plan["tensor_artifact"]:
                 raise ValueError("training tasks used inconsistent automatic rank selections")
-            verify_identity(result["best_checkpoint"])
+            checkpoint = verify_identity(result["best_checkpoint"])
+            if checkpoint.resolve() != (Path(training_task["checkpoint_dir"]) / "best.pt").resolve():
+                raise ValueError(f"checkpoint is outside the training task: {training_task['key']}")
             rows.append({key: training_task[key] for key in
                          ("index", "key", "architecture", "num_particles", "seed")})
+            rows[-1]["training_index"] = training_task["index"]
+            rows[-1]["index"] = len(rows) - 1
+            rows[-1]["training_result"] = identity(result_path)
             rows[-1]["checkpoint"] = result["best_checkpoint"]
+        if not rows:
+            raise ValueError("no completed training tasks available for evaluation")
+        training_selection = {"requested": requested, "total_training_tasks": len(training_plan["tasks"]),
+                              "selected_training_indices": [row["training_index"] for row in rows],
+                              "excluded": excluded}
     elif args.mode == "matrix-followup":
         if args.prepare_plan is None or args.after_job is None:
             raise ValueError("matrix-followup requires --prepare-plan and --after-job")
@@ -271,6 +312,8 @@ def make_plan(args: argparse.Namespace) -> Path:
                     "after_job": str(args.after_job),
                     "rank_policy": {"mean_limit": args.rank_mean_limit, "max_limit": args.rank_max_limit}}
     else:
+        if getattr(args, "training_tasks", "all") != "all":
+            raise ValueError("--training-tasks is only valid for matrix-evaluate")
         if args.manifest is None:
             raise ValueError("--manifest is required")
         manifest = args.manifest.expanduser().resolve(strict=True)
@@ -314,6 +357,8 @@ def make_plan(args: argparse.Namespace) -> Path:
         "training_plan": identity(args.training_plan) if training_plan else None,
         "training_commit": training_plan["commit"] if training_plan else None,
         "training_cluster": plan_cluster(training_plan) if training_plan else None,
+        "training_selection": training_selection,
+        "evaluation_figures": effective_mode == "matrix-evaluate",
         "followup": followup,
         "training_rank_selection": training_plan.get("rank_selection") if training_plan else None,
     }
@@ -339,6 +384,11 @@ def task_command(document: dict, task: dict, *, resume: bool = False) -> list[st
                    "--output-dir", str(Path(task["record_dir"]) / "evaluation")]
         for key, value in document["evaluation"].items():
             command += ["--" + key.replace("_", "-"), str(value)]
+        if document.get("evaluation_figures"):
+            command += ["--figures"]
+        if os.environ.get("FLOW3D_EVALUATE_BUDGET_SECONDS"):
+            budget = positive(os.environ["FLOW3D_EVALUATE_BUDGET_SECONDS"])
+            command += ["--max-runtime-seconds", str(budget)]
         if resume:
             command += ["--resume"]
         return command
@@ -368,6 +418,19 @@ def validate_evaluation(summary: dict, document: dict, task: dict) -> None:
             or group.get("trained_particles") != task["num_particles"]
             or summary.get("boundary_projection") != "final"):
         raise ValueError("evaluation incomplete or scientific provenance/boundary protocol failed")
+    if document.get("evaluation_figures"):
+        options = document["evaluation"]
+        expected_fields = {"requested_test_cases_per_count": expected, "expected_runs": expected,
+                           "particle_counts": [task["num_particles"]],
+                           "base_seed": options["seed"], "num_posterior_samples": options["num_samples"],
+                           "num_probe_particles": options["num_probe_particles"],
+                           "sampling_steps": options["sampling_steps"], "eta": options["eta"],
+                           "cfg_scale": options["cfg_scale"]}
+        if any(summary.get(key) != value for key, value in expected_fields.items()):
+            raise ValueError("evaluation summary differs from the frozen sampling protocol")
+        if (Path(summary.get("manifest", "")).resolve() != Path(document["manifest"]["path"]).resolve()
+                or Path(group.get("checkpoint", "")).resolve() != Path(task["checkpoint"]["path"]).resolve()):
+            raise ValueError("evaluation summary uses a different manifest or checkpoint")
 
 
 def summarize_plan(plan_path: Path, output_dir: Path | None = None) -> dict:
@@ -379,6 +442,11 @@ def summarize_plan(plan_path: Path, output_dir: Path | None = None) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     tasks, per_seed, per_case = [], [], []
     by_group = {}
+    source_tasks = (read_plan(verify_identity(document["training_plan"]))["tasks"]
+                    if document.get("training_plan") else document["tasks"])
+    expected_seeds = {}
+    for source in source_tasks:
+        expected_seeds.setdefault((source["architecture"], source["num_particles"]), set()).add(source["seed"])
     for task in document["tasks"]:
         item = {key: task[key] for key in ("index", "key", "architecture", "num_particles", "seed")}
         item.update(status="missing", metrics={})
@@ -420,13 +488,15 @@ def summarize_plan(plan_path: Path, output_dir: Path | None = None) -> dict:
             values = [member["metrics"][name]["mean"] for member in valid
                       if name in member["metrics"] and math.isfinite(member["metrics"][name]["mean"])]
             aggregates.append({"architecture": architecture, "num_particles": count,
-                               "expected_seeds": len(members), "valid_seeds": len(values),
-                               "complete": len(values) == len(members), "metric": name,
+                               "expected_seeds": len(expected_seeds[(architecture, count)]), "valid_seeds": len(values),
+                               "complete": len(values) == len(expected_seeds[(architecture, count)]), "metric": name,
                                "seed_mean": statistics.fmean(values) if values else None,
                                "seed_std": statistics.stdev(values) if len(values) > 1 else None})
     result = {"plan": str(plan_path.resolve()), "plan_sha256": digest(plan_path),
               "complete": all(item["status"] == "completed" for item in tasks),
               "expected_tasks": len(tasks), "completed_tasks": sum(item["status"] == "completed" for item in tasks),
+              "original_training_tasks": len(source_tasks), "completion_scope": "selected evaluation tasks",
+              "full_training_matrix_evaluated": len(tasks) == len(source_tasks) and all(item["status"] == "completed" for item in tasks),
               "seed_std_ddof": 1, "aggregation": "mean and sample std of per-training-seed test means",
               "tasks": tasks, "aggregates": aggregates}
     write_json(output_dir / "summary.json", result)
@@ -470,6 +540,8 @@ def run_task(args: argparse.Namespace) -> None:
         verify_identity(document["tensor_artifact"])
     if task.get("checkpoint"):
         verify_identity(task["checkpoint"])
+    if task.get("training_result"):
+        verify_identity(task["training_result"])
     import torch
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise ValueError("exactly one CUDA GPU is required")
@@ -535,6 +607,11 @@ def run_task(args: argparse.Namespace) -> None:
                 summary = Path(task["record_dir"]) / "evaluation" / "summary.json"
                 validate_evaluation(json.loads(summary.read_text(encoding="utf-8")), document, task)
                 result["summary"] = identity(summary)
+                if document.get("evaluation_figures"):
+                    report_dir = record / "report"
+                    run_logged([sys.executable, str(REPOSITORY / "scripts" / "visualize_matrix_evaluation.py"),
+                                "report", "--plan", str(args.plan), "--output-dir", str(report_dir)], attempt)
+                    result["report_dir"] = str(report_dir)
             else:
                 report = Path(document["prepare_output"]) / "report.json"
                 result["report"] = identity(report)
@@ -543,6 +620,10 @@ def run_task(args: argparse.Namespace) -> None:
             result["status"] = "completed"
         except BaseException as error:
             result.update(status="failed", error=f"{type(error).__name__}: {error}")
+            if isinstance(error, subprocess.CalledProcessError):
+                result["exit_code"] = error.returncode
+                if document["mode"] == "matrix-evaluate" and error.returncode == 75:
+                    result.update(status="partial", stop_reason="time_budget_exhausted")
             raise
         finally:
             result["elapsed_seconds"] = time.monotonic() - started
@@ -559,6 +640,8 @@ def main() -> None:
     plan.add_argument("--manifest", type=Path, default=os.environ.get("FLOW3D_MANIFEST"))
     plan.add_argument("--tensor-artifact", type=Path)
     plan.add_argument("--training-plan", type=Path)
+    plan.add_argument("--training-tasks", default="all",
+                      help="Evaluation only: all, completed, or comma-separated original training task IDs. Selection is frozen at submission.")
     plan.add_argument("--prepare-plan", type=Path)
     plan.add_argument("--after-job", type=positive)
     plan.add_argument("--rank-mean-limit", type=float, default=0.05)
@@ -587,6 +670,8 @@ def main() -> None:
     resume.add_argument("--dry-run", action="store_true")
     timing = subparsers.add_parser("check-time")
     timing.add_argument("value")
+    budget = subparsers.add_parser("time-budget")
+    budget.add_argument("value")
     summarize = subparsers.add_parser("summarize")
     summarize.add_argument("--plan", type=Path, required=True)
     summarize.add_argument("--output-dir", type=Path)
@@ -630,8 +715,12 @@ def main() -> None:
         elif args.action == "summarize":
             summary = summarize_plan(args.plan, args.output_dir)
             print(json.dumps({key: summary[key] for key in ("complete", "expected_tasks", "completed_tasks")}))
+        elif args.action == "time-budget":
+            print(max(1, validate_time(args.value) - 300))
         else:
             validate_time(args.value)
+    except subprocess.CalledProcessError as error:
+        parser.exit(error.returncode, f"flow3d matrix: subprocess stopped with exit code {error.returncode}\n")
     except (ValueError, OSError, KeyError) as error:
         parser.exit(2, f"flow3d matrix: {error}\n")
 

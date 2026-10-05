@@ -18,6 +18,8 @@ U-Net、完整三维 DiT、对齐 Tucker 空间 DiT，覆盖 2、4、6、12、24
 也支持 [Delta A100 两小时时限的正式训练](docs/delta-matrix.md)，复用同一份数据和
 Tucker 缓存，新批次独立记录；不会自动取消或去重另一集群的作业。
 
+已完成模型可先运行 [GH200 全测试集评估与组会图片](docs/gh200-evaluation.md)，按 90 分钟时限提交、逐案例续跑并生成 PNG/PDF 和指标报告。
+
 在 HPC 首次克隆整个仓库后，从 `project/` 运行工作流模板：
 
 ```bash

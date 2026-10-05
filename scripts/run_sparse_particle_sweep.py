@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import csv
 from datetime import datetime, timezone
+import hashlib
 import io
 import json
 import math
@@ -22,6 +23,7 @@ import subprocess
 import sys
 import time
 from typing import Any
+import zipfile
 
 import torch
 import numpy as np
@@ -29,6 +31,7 @@ import numpy as np
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_SAMPLER = _REPOSITORY_ROOT / "scripts" / "sample_sparse_track_diffusion.py"
+_DEFAULT_VISUALIZER = _REPOSITORY_ROOT / "scripts" / "visualize_matrix_evaluation.py"
 _SUPPORTED_PARTICLE_COUNTS = (2, 4, 6, 8, 12, 24, 32, 48, 64, 96, 128)
 _DEFAULT_PARTICLE_COUNTS = (2, 4, 6, 12, 24, 48, 96)
 _EXTRAPOLATION_WARNING = (
@@ -49,6 +52,13 @@ def _nonnegative_float(value: str) -> float:
     parsed = float(value)
     if not math.isfinite(parsed) or parsed < 0.0:
         raise argparse.ArgumentTypeError("must be finite and non-negative")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = _nonnegative_float(value)
+    if parsed == 0.0:
+        raise argparse.ArgumentTypeError("must be finite and positive")
     return parsed
 
 
@@ -142,6 +152,22 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sampling-steps", type=_positive_integer, default=50)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--figures", action="store_true",
+        help=(
+            "Write report figures for fixed test case 0 at every particle count. "
+            "Resume also regenerates these figures from existing posterior archives."
+        ),
+    )
+    parser.add_argument(
+        "--max-runtime-seconds", type=_positive_float, default=None,
+        help=(
+            "Stop at a completed-case boundary before starting another case when "
+            "this process exhausts its budget or the current-run mean case time "
+            "exceeds the remaining budget. Preserve progress and exit 75. "
+            "This cannot interrupt or bound a single long case."
+        ),
+    )
 
     parser.add_argument("--eta", type=_nonnegative_float, default=1.0)
     parser.add_argument("--cfg-scale", type=_nonnegative_float, default=1.5)
@@ -332,6 +358,104 @@ def _load_run_result(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     return metrics, metadata
 
 
+def _write_case_figures(
+    args: argparse.Namespace, output_path: Path, output_dir: Path, particle_count: int,
+) -> None:
+    """Regenerate the fixed example, including when sampling was already done."""
+    _, metadata = _load_run_result(output_path)
+    architecture = metadata.get("architecture")
+    training_seed = metadata.get("training_seed")
+    if not isinstance(architecture, str) or not architecture:
+        raise ValueError("example posterior metadata lacks its architecture")
+    if not isinstance(training_seed, int) or isinstance(training_seed, bool):
+        raise ValueError("example posterior metadata lacks its integer training_seed")
+    command = [
+        str(args.python), str(_DEFAULT_VISUALIZER), "case",
+        "--posterior", str(output_path),
+        "--output-dir", str(output_dir / "figures" / f"N{particle_count:03d}_case0000"),
+        "--architecture", architecture,
+        "--num-particles", str(particle_count),
+        "--training-seed", str(training_seed),
+        "--test-case-index", "0",
+    ]
+    print("Generating fixed test-case example: " + subprocess.list2cmdline(command), flush=True)
+    result = subprocess.run(command, cwd=_REPOSITORY_ROOT, check=False, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"example figure generation exited with code {result.returncode}")
+
+
+def _runtime_budget_stop_reason(
+    budget: float | None, elapsed: float, new_case_seconds: list[float],
+) -> str | None:
+    if budget is None:
+        return None
+    remaining = budget - elapsed
+    if remaining <= 0:
+        return f"runtime budget reached ({elapsed:.1f}/{budget:.1f} seconds)"
+    if new_case_seconds and statistics.fmean(new_case_seconds) > remaining:
+        return (
+            f"runtime budget has {remaining:.1f} seconds left, less than the "
+            f"current-run mean case time of {statistics.fmean(new_case_seconds):.1f} seconds"
+        )
+    return None
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sweep_protocol(args: argparse.Namespace, checkpoints: dict[int, Path]) -> dict[str, Any]:
+    """Freeze the scientific design once per invocation, outside the case loop."""
+    hashes = {path: _sha256_file(path) for path in set(checkpoints.values())}
+    manifest = args.manifest.expanduser().resolve()
+    return {
+        "format_version": 1,
+        "manifest": str(manifest),
+        "manifest_sha256": _sha256_file(manifest),
+        "checkpoints": {
+            str(count): {"path": str(path), "sha256": hashes[path]}
+            for count, path in checkpoints.items()
+        },
+        "particle_counts": list(args.particle_counts),
+        "num_test_cases": args.num_test_cases,
+        "num_probe_particles": args.num_probe_particles,
+        "num_samples": args.num_samples,
+        "sampling_steps": args.sampling_steps,
+        "seed": args.seed,
+        "eta": args.eta,
+        "cfg_scale": args.cfg_scale,
+        "boundary_projection": args.boundary_projection,
+        "trajectory_guidance_strength": args.trajectory_guidance_strength,
+        "divergence_guidance_weight": args.divergence_guidance_weight,
+        "trajectory_substeps": args.trajectory_substeps,
+        "use_raw_weights": args.use_raw_weights,
+        "allow_untrained_count_extrapolation": args.allow_untrained_count_extrapolation,
+    }
+
+
+def _legacy_record_matches_protocol(
+    args: argparse.Namespace, record: dict[str, Any], checkpoints: dict[int, Path],
+) -> bool:
+    """Older sweeps retain complete commands even without a protocol sidecar."""
+    try:
+        count = int(record["num_particles"])
+        index = int(record["test_case_index"])
+        expected = _build_sampler_command(
+            args, checkpoint=checkpoints[count], particle_count=count, case_index=index,
+            run_seed=args.seed + index, output_path=Path(record["output"]),
+        )
+        command = record["command"]
+        # Python and sampler locations can change after an environment move;
+        # every scientific option and data/checkpoint/output path must match.
+        return isinstance(command, list) and command[2:] == expected[2:]
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8", newline="\n") as stream:
         stream.write(json.dumps(record, sort_keys=True) + "\n")
@@ -340,28 +464,32 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
 
 
 def _load_resumable_records(
-    path: Path, expected_outputs: dict[str, Path]
+    path: Path, expected_outputs: dict[str, Path], *, args: argparse.Namespace | None = None,
 ) -> list[dict[str, Any]]:
     """Return valid completed records in deterministic sweep order.
 
     A record is resumable only when it belongs to the current run plan, reports
     completion, names the expected output path, and that posterior archive is
-    still present. Failed, planned, malformed, duplicate, and stale records are
-    discarded so their run IDs are executed again.
+    readable with matching metrics/metadata. Failed, planned, stale, or damaged
+    archives are discarded so their run IDs are executed again. A torn final
+    JSONL line is discarded; malformed JSON in any earlier line remains an error.
     """
 
     if not path.is_file():
         return []
 
     retained: dict[str, dict[str, Any]] = {}
-    for line_number, raw_line in enumerate(
-        path.read_text(encoding="utf-8").splitlines(), start=1
-    ):
+    content = path.read_text(encoding="utf-8")
+    lines = content.splitlines()
+    for line_number, raw_line in enumerate(lines, start=1):
         if not raw_line.strip():
             continue
         try:
             decoded = json.loads(raw_line)
         except json.JSONDecodeError as error:
+            if line_number == len(lines) and not content.endswith("\n"):
+                print(f"Ignoring interrupted final JSONL line in {path}", flush=True)
+                continue
             raise ValueError(
                 f"invalid JSON in resume log {path} at line {line_number}: {error}"
             ) from error
@@ -381,6 +509,30 @@ def _load_resumable_records(
         if Path(output_value).expanduser().resolve() != expected_output:
             continue
         if not expected_output.is_file():
+            continue
+        try:
+            metrics, metadata = _load_run_result(expected_output)
+            if (
+                int(metrics["num_observed_particles"]) != decoded["num_particles"]
+                or int(metadata["sampled_particles"]) != decoded["num_particles"]
+                or int(metadata["trained_particles"]) != decoded["trained_particles"]
+                or metadata.get("split") != "test"
+                or metadata.get("case_id") != decoded.get("case_id")
+                or metadata.get("scientific_result") != decoded.get("source_scientific_result")
+            ):
+                raise ValueError("posterior metadata no longer matches its completion record")
+            if args is not None:
+                for name in ("sampling_steps", "eta", "cfg_scale", "trajectory_guidance_strength"):
+                    if name in metadata and metadata[name] != getattr(args, name):
+                        raise ValueError(f"posterior {name} differs from the sampling protocol")
+                for name, expected in (
+                    ("num_posterior_samples", args.num_samples),
+                    ("num_probe_particles", args.num_probe_particles),
+                ):
+                    if name in metrics and metrics[name] != expected:
+                        raise ValueError(f"posterior {name} differs from the sampling protocol")
+        except (OSError, EOFError, KeyError, TypeError, ValueError, zipfile.BadZipFile) as error:
+            print(f"Retrying {run_id}: completed posterior is invalid: {error}", flush=True)
             continue
         retained[run_id] = decoded
 
@@ -516,6 +668,8 @@ def _build_summary(
         "eta": args.eta,
         "cfg_scale": args.cfg_scale,
         "device": args.device,
+        "figures_requested": bool(getattr(args, "figures", False)),
+        "figure_test_case_indices": [0] if getattr(args, "figures", False) else [],
         "manifest": str(args.manifest.expanduser().resolve()),
         "per_particle_count": per_count,
     }
@@ -564,6 +718,11 @@ def _write_summaries(output_dir: Path, summary: dict[str, Any]) -> None:
 
 
 def run_sweep(args: argparse.Namespace) -> dict[str, Any]:
+    process_started = time.perf_counter()
+    new_case_seconds: list[float] = []
+    budget = getattr(args, "max_runtime_seconds", None)
+    if budget is not None and (not math.isfinite(budget) or budget <= 0.0):
+        raise ValueError("--max-runtime-seconds must be finite and positive")
     if args.num_probe_particles < 0:
         raise ValueError("--num-probe-particles must be non-negative")
     if (
@@ -591,6 +750,7 @@ def run_sweep(args: argparse.Namespace) -> dict[str, Any]:
     runs_path = output_dir / "runs.jsonl"
     summary_path = output_dir / "summary.json"
     csv_path = output_dir / "summary.csv"
+    protocol_path = output_dir / "protocol.json"
     expected_outputs: dict[str, Path] = {}
     for case_index in range(args.num_test_cases):
         run_seed = args.seed + case_index
@@ -601,15 +761,43 @@ def run_sweep(args: argparse.Namespace) -> dict[str, Any]:
                 / f"N{particle_count:03d}"
                 / f"case_{case_index:04d}_seed_{run_seed}.npz"
             ).resolve()
-    occupied = [path for path in (runs_path, summary_path, csv_path) if path.exists()]
+    occupied = [path for path in (runs_path, summary_path, csv_path, protocol_path) if path.exists()]
     if occupied and not (args.overwrite or args.resume):
         names = ", ".join(path.name for path in occupied)
         raise FileExistsError(
             f"output directory already contains {names}; use --resume to continue "
             "or --overwrite to restart"
         )
+    protocol = None if args.dry_run else _sweep_protocol(args, checkpoints)
+    legacy_resume = bool(args.resume and not args.dry_run and not protocol_path.exists())
+    if args.resume and protocol is not None and protocol_path.exists():
+        previous = json.loads(protocol_path.read_text(encoding="utf-8"))
+        if previous != protocol:
+            raise ValueError(
+                "resume protocol differs: checkpoint/manifest contents or scientific "
+                "sampling parameters changed. Use a new output directory; only "
+                "figures and the runtime budget may change for this sweep."
+            )
     if args.resume:
-        records = _load_resumable_records(runs_path, expected_outputs)
+        records = _load_resumable_records(runs_path, expected_outputs, args=args)
+        if legacy_resume:
+            print(
+                "Legacy resume: no protocol.json was recorded. Reusing only cases "
+                "whose complete saved sampling command matches this request. Prior "
+                "checkpoint/manifest hashes cannot be verified retroactively.",
+                flush=True,
+            )
+            compatible = []
+            for record in records:
+                if _legacy_record_matches_protocol(args, record, checkpoints):
+                    compatible.append(record)
+                else:
+                    print(
+                        f"Retrying {record['run_id']}: legacy sampling command differs "
+                        "or is missing; no incompatible results will be combined.",
+                        flush=True,
+                    )
+            records = compatible
         _rewrite_jsonl(runs_path, records)
         print(
             f"Resuming with {len(records)}/{len(expected_outputs)} completed runs",
@@ -618,10 +806,29 @@ def run_sweep(args: argparse.Namespace) -> dict[str, Any]:
     else:
         records = []
         runs_path.write_text("", encoding="utf-8")
+    if protocol is not None:
+        _atomic_write_text(protocol_path, json.dumps(protocol, indent=2, sort_keys=True) + "\n")
     completed_run_ids = {record["run_id"] for record in records}
 
     if not scientific_design:
         print(_EXTRAPOLATION_WARNING, file=sys.stderr, flush=True)
+
+    def ensure_figures(particle_count: int, case_index: int, output_path: Path) -> None:
+        if not getattr(args, "figures", False) or case_index != 0 or args.dry_run:
+            return
+        try:
+            _write_case_figures(args, output_path, output_dir, particle_count)
+        except (OSError, KeyError, TypeError, ValueError, RuntimeError) as error:
+            summary = _build_summary(
+                args, records, checkpoints, trained_counts,
+                scientific_design=scientific_design, complete=False, dry_run=False,
+                partial_reason=f"example figures failed for N={particle_count}: {error}",
+            )
+            _write_summaries(output_dir, summary)
+            raise RuntimeError(
+                f"example figures failed for N={particle_count}; completed sampling "
+                f"is preserved. Use --resume to regenerate figures: {error}"
+            ) from error
 
     for case_index in range(args.num_test_cases):
         run_seed = args.seed + case_index
@@ -633,7 +840,27 @@ def run_sweep(args: argparse.Namespace) -> dict[str, Any]:
             run_id = f"N{particle_count:03d}_case_{case_index:04d}"
             if run_id in completed_run_ids:
                 print(f"Skipping completed {run_id}", flush=True)
+                ensure_figures(particle_count, case_index, output_path)
                 continue
+            if not args.dry_run:
+                stop_reason = _runtime_budget_stop_reason(
+                    budget, time.perf_counter() - process_started, new_case_seconds,
+                )
+                if stop_reason is not None:
+                    summary = _build_summary(
+                        args, records, checkpoints, trained_counts,
+                        scientific_design=scientific_design, complete=False, dry_run=False,
+                        partial_reason=stop_reason,
+                    )
+                    summary["runtime_budget_exhausted"] = True
+                    _write_summaries(output_dir, summary)
+                    print(
+                        f"Stopped before {run_id}: {stop_reason}. Completed results "
+                        "are preserved; use --resume. This budget excludes queue time.",
+                        flush=True,
+                    )
+                    return summary
+            case_started = time.perf_counter()
             command = _build_sampler_command(
                 args,
                 checkpoint=checkpoints[particle_count],
@@ -804,6 +1031,7 @@ def run_sweep(args: argparse.Namespace) -> dict[str, Any]:
             }
             records.append(record)
             _append_jsonl(runs_path, record)
+            completed_run_ids.add(run_id)
             partial_summary = _build_summary(
                 args,
                 records,
@@ -815,9 +1043,18 @@ def run_sweep(args: argparse.Namespace) -> dict[str, Any]:
                 partial_reason="sweep in progress",
             )
             _write_summaries(output_dir, partial_summary)
+            ensure_figures(particle_count, case_index, output_path)
+            case_seconds = time.perf_counter() - case_started
+            new_case_seconds.append(case_seconds)
+            remaining_runs = len(expected_outputs) - len(completed_run_ids)
+            estimated_remaining = statistics.fmean(new_case_seconds) * remaining_runs
             print(
                 f"Completed N={particle_count}, case={case_index + 1}/"
-                f"{args.num_test_cases}",
+                f"{args.num_test_cases}; total={len(completed_run_ids)}/{len(expected_outputs)}; "
+                f"sampler_process_seconds={elapsed:.1f}; case_seconds={case_seconds:.1f}; "
+                f"rough_remaining_minutes={estimated_remaining / 60:.1f} "
+                f"(based on {len(new_case_seconds)} new cases in this invocation; "
+                "excludes queue time; sampler time includes model loading and metrics)",
                 flush=True,
             )
 
@@ -854,6 +1091,8 @@ def main() -> None:
     print(f"Wrote CSV summary to {args.output_dir / 'summary.csv'}")
     if summary["warning"]:
         print(summary["warning"], file=sys.stderr)
+    if summary.get("runtime_budget_exhausted"):
+        raise SystemExit(75)
 
 
 if __name__ == "__main__":

@@ -51,6 +51,12 @@ case "$actual_mode" in
     *) flow3d_die '无效的计划模式' ;;
 esac
 python "$runner" check-time "$time_limit"
+if [[ "$actual_mode" = matrix-evaluate ]]; then
+    # Leave five minutes for environment setup, final records and figures.
+    # A single long-running case can still reach Slurm's hard limit.
+    export FLOW3D_EVALUATE_BUDGET_SECONDS
+    FLOW3D_EVALUATE_BUDGET_SECONDS=$(python "$code_dir/../scripts/run_hpc_matrix.py" time-budget "$time_limit")
+fi
 array=$(python "$runner" array --plan "$plan" --tasks "${FLOW3D_ARRAY_TASKS:-all}")
 options=(--job-name="flow3d_${actual_mode#matrix-}" --account="$FLOW3D_ACCOUNT" --partition="$FLOW3D_PARTITION"
     --nodes=1 --ntasks=1 --cpus-per-task="$FLOW3D_CPUS" --mem="$FLOW3D_MEM"

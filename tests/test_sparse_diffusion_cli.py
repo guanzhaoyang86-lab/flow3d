@@ -439,7 +439,11 @@ def test_sweep_resume_skips_completed_and_retries_failed_or_missing(
     checkpoint_path = Path(args.shared_checkpoint)
     retained_output = output_dir / "N002" / "case_0000_seed_47.npz"
     retained_output.parent.mkdir(parents=True)
-    retained_output.write_bytes(b"retained")
+    np.savez_compressed(retained_output,
+        metrics=np.asarray(json.dumps({"num_observed_particles": 2, "score": 2.0})),
+        metadata=np.asarray(json.dumps({"trained_particles": 2, "sampled_particles": 2,
+                                       "split": "test", "case_id": "retained-case",
+                                       "scientific_result": False})))
     missing_output = output_dir / "N008" / "case_0000_seed_47.npz"
     failed_output = output_dir / "N004" / "case_0000_seed_47.npz"
     failed_output.parent.mkdir(parents=True)
@@ -469,6 +473,9 @@ def test_sweep_resume_skips_completed_and_retries_failed_or_missing(
             checkpoint=checkpoint_path,
         ),
     ]
+    existing_records[0]["command"] = _SWEEP._build_sampler_command(
+        args, checkpoint=checkpoint_path.resolve(), particle_count=2,
+        case_index=0, run_seed=args.seed, output_path=retained_output.resolve())
     runs_path.write_text(
         "".join(json.dumps(record) + "\n" for record in existing_records),
         encoding="utf-8",
