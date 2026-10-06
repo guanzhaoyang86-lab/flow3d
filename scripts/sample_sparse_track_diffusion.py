@@ -22,6 +22,7 @@ if str(_SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(_SOURCE_ROOT))
 
 from flow_observation.diffusion import GaussianDiffusion
+from flow_observation.checkpoint_io import load_trusted_checkpoint
 from flow_observation.models.trajectory_encoder import TrackSetEncoder
 from flow_observation.models.unet3d import ConditionalUNet3D
 from flow_observation.models.factory import build_denoiser, diffusion_clip
@@ -298,7 +299,7 @@ def sample(args: argparse.Namespace) -> Path:
         )
     device = _resolve_device(args.device)
     checkpoint_path = args.checkpoint.expanduser().resolve()
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    checkpoint = load_trusted_checkpoint(checkpoint_path, map_location="cpu")
     if not isinstance(checkpoint, dict) or checkpoint.get("format_version") != 1:
         raise ValueError("unsupported sparse diffusion checkpoint")
     trained_particles = int(checkpoint["data_config"]["num_particles"])

@@ -30,6 +30,12 @@ import numpy as np
 
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+_SOURCE_ROOT = _REPOSITORY_ROOT / "src"
+if str(_SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SOURCE_ROOT))
+
+from flow_observation.checkpoint_io import load_trusted_checkpoint
+
 _DEFAULT_SAMPLER = _REPOSITORY_ROOT / "scripts" / "sample_sparse_track_diffusion.py"
 _DEFAULT_VISUALIZER = _REPOSITORY_ROOT / "scripts" / "visualize_matrix_evaluation.py"
 _SUPPORTED_PARTICLE_COUNTS = (2, 4, 6, 8, 12, 24, 32, 48, 64, 96, 128)
@@ -253,7 +259,7 @@ def _resolve_checkpoint_policy(
 def _checkpoint_particle_count(path: Path) -> int:
     if not path.is_file():
         raise FileNotFoundError(f"checkpoint does not exist: {path}")
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    checkpoint = load_trusted_checkpoint(path, map_location="cpu")
     if not isinstance(checkpoint, dict):
         raise ValueError(f"checkpoint is not a dictionary: {path}")
     data_config = checkpoint.get("data_config")
