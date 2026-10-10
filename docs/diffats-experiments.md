@@ -194,6 +194,38 @@ unset FLOW3D_ARRAY_TASKS
 
 有 `latest.pt` 时从已完成的 epoch 恢复，并保留原 `best.pt` 对应的历史最佳模型；没有 checkpoint 且输出为空时重试原任务；完成任务禁止覆盖。评估中断也可用其评估计划 `matrix-resume`，已完成案例会复用。压缩准备失败则重新提交准备任务，使用新输出目录。锁防止同一任务同时运行。快照必须保留到全部任务及重试完成。
 
+### 互连启动错误自动重试
+
+矩阵训练、测试和预处理现在默认对下面的 Slurm 启动错误额外重试最多 3 次（含首次共 4 次），每次等待 30 秒：
+
+```text
+srun: error: task 0 launch failed: Error configuring interconnect
+```
+
+每次启动会先在共享存储写入标记，再执行实验程序。只有收到上述错误且程序尚未启动时才允许重试；Python 异常、显存不足、用户取消、超时或程序已经开始运行均不会触发自动重试。重试仍在同一个 GPU 作业和节点内进行，不重新排队、不延长时间上限；持续的节点故障仍可能失败，需要联系集群支持。评估预算扣除启动和重试耗时。可用 `FLOW3D_LAUNCH_RETRIES=0` 关闭，最大允许 3；`FLOW3D_LAUNCH_RETRY_DELAY` 为等待秒数，默认 30。
+
+重试日志在 `$FLOW3D_ROOT/logs/launch-<jobid>-*/`，包含每次的退出码、是否启动、是否重试，以及科学代码和启动器的提交号。`matrix-resume` 保留原计划、科学代码快照和 checkpoint，同时从当前 GitHub 单独冻结启动器以应用修复。两个快照均需保留。已在 Slurm 排队的旧任务不会因 `git pull` 自动更新。
+
+训练成功后提交全量测试（等待新训练数组的所有子任务成功）：
+
+```bash
+export FLOW3D_EVALUATE_TIME=01:30:00
+export FLOW3D_ARRAY_CONCURRENCY=16
+bash scripts/submit_test_after.sh --training-plan "$TRAINING_PLAN" --dependency "$NEW_TRAIN_JOB"
+```
+
+如果训练已经全部完成，省略 `--dependency`，提交前会验证全部训练结果。全量评估计划在训练成功后生成一次，并固定测试协议及 checkpoint；任务包含指标和图片输出。若训练失败，`afterok` 依赖不满足，测试不会自动运行。已生成评估计划的中断测试仍使用 `matrix-resume --plan <评估计划>` 恢复。
+
+替换一对**全部仍在 PENDING** 的旧训练/全量测试数组，应用最新启动器：
+
+```bash
+bash scripts/replace_pending_matrix.sh \
+  --training-plan "$TRAINING_PLAN" \
+  --training-job "$OLD_TRAIN_JOB" --test-job "$OLD_TEST_JOB"
+```
+
+此命令先暂停旧数组，提交新的暂缓数组并建立成功依赖，确认提交成功后取消旧待运行数组，再放行新数组。原有排队位置不会保留。有任务正在运行、状态变化或编号不匹配时停止，不取消运行中的任务。执行中断时保留日志和已知作业编号，先检查状态，避免重复执行。
+
 需要改变粒子数、秩、模型、随机种子或 epochs 时，提交新的计划；不要将它们作为原任务恢复。没有自动跨粒子数使用 checkpoint 的流程。
 
 参考：[DiffATS 论文](https://arxiv.org/html/2605.09275v1)、[DiffATS 作者代码](https://github.com/JinhuaLyu/DiffATS)、[DiT 官方实现](https://github.com/facebookresearch/DiT)、[Slurm 数组](https://slurm.schedmd.com/job_array.html)。此处是面向投影粒子轨迹与三分量稳态流场的适配，不是论文原 PDE 条件输入的直接复现。
