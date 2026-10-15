@@ -21,6 +21,7 @@ Condition = Tensor | None
 Denoiser = Callable[[Tensor, Tensor, Condition], Tensor]
 GuidanceLoss = Callable[[Tensor, Tensor], Tensor]
 Projection = Callable[[Tensor], Tensor]
+TraceCallback = Callable[[dict[str, Any]], None]
 
 
 def cosine_beta_schedule(
@@ -207,6 +208,7 @@ class GaussianDiffusion(nn.Module):
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
         initial_noise: Tensor | None = None,
+        trace_callback: TraceCallback | None = None,
     ) -> Tensor:
         """Generate normalized fields with deterministic or stochastic DDIM.
 
@@ -215,6 +217,13 @@ class GaussianDiffusion(nn.Module):
         prediction before the DDIM update.  It is intended for differentiable
         trajectory/physics consistency. ``projection`` is a non-learned hard
         constraint such as overwriting known cavity boundaries.
+
+        ``trace_callback`` observes each completed update (zero-based ``step``).
+        It receives detached copies of the input, predicted epsilon, raw and
+        clipped x0, clean value after guidance/projection, and updated sample.
+        The final update has ``previous_timestep=-1``. Copies protect sampling
+        from observer mutation; callback exceptions propagate to the caller.
+        Observers must not consume random numbers or retain unbounded tensors.
         """
 
         if not ((len(shape) == 5 and shape[1] == 3) or len(shape) == 2) or any(
@@ -265,7 +274,9 @@ class GaussianDiffusion(nn.Module):
             (schedule[1:], torch.full((1,), -1, device=sample.device, dtype=torch.long))
         )
 
-        for step_value, previous_value in zip(schedule.tolist(), previous.tolist()):
+        for step_index, (step_value, previous_value) in enumerate(
+            zip(schedule.tolist(), previous.tolist())
+        ):
             timesteps = torch.full(
                 (shape[0],), step_value, device=sample.device, dtype=torch.long
             )
@@ -281,6 +292,24 @@ class GaussianDiffusion(nn.Module):
                 clean = self.predict_x0_from_noise(
                     sample, timesteps, predicted_noise
                 )
+                trace = None
+                if trace_callback is not None:
+                    # Keep the production prediction/update unchanged. Compute
+                    # the pre-clipping value only when explicitly tracing.
+                    raw_clean = (
+                        sample
+                        - _extract(self.sqrt_one_minus_alpha_bars, timesteps, sample)
+                        * predicted_noise
+                    ) / _extract(self.sqrt_alpha_bars, timesteps, sample).clamp_min(1e-12)
+                    trace = {
+                        "step": step_index,
+                        "timestep": step_value,
+                        "previous_timestep": previous_value,
+                        "sample": sample.detach().clone(),
+                        "predicted_noise": predicted_noise.detach().clone(),
+                        "predicted_x0_raw": raw_clean.detach().clone(),
+                        "predicted_x0": clean.detach().clone(),
+                    }
 
             if guidance_loss is not None and guidance_strength > 0.0:
                 with torch.enable_grad():
@@ -305,34 +334,41 @@ class GaussianDiffusion(nn.Module):
             )
             if previous_value < 0:
                 sample = clean
-                continue
-            alpha_bar_previous = self.alpha_bars[previous_value].to(
-                device=sample.device, dtype=sample.dtype
-            )
-            reconstructed_noise = (
-                sample - alpha_bar.sqrt() * clean
-            ) / (1.0 - alpha_bar).sqrt().clamp_min(1e-12)
-            sigma = eta * torch.sqrt(
-                ((1.0 - alpha_bar_previous) / (1.0 - alpha_bar))
-                * (1.0 - alpha_bar / alpha_bar_previous).clamp_min(0.0)
-            )
-            direction_scale = (1.0 - alpha_bar_previous - sigma.square()).clamp_min(
-                0.0
-            ).sqrt()
-            if eta > 0.0:
-                random_noise = torch.randn(
-                    sample.shape,
+            else:
+                alpha_bar_previous = self.alpha_bars[previous_value].to(
                     device=sample.device,
                     dtype=sample.dtype,
-                    generator=generator,
                 )
-            else:
-                random_noise = torch.zeros_like(sample)
-            sample = (
-                alpha_bar_previous.sqrt() * clean
-                + direction_scale * reconstructed_noise
-                + sigma * random_noise
-            )
+                reconstructed_noise = (
+                    sample - alpha_bar.sqrt() * clean
+                ) / (1.0 - alpha_bar).sqrt().clamp_min(1e-12)
+                sigma = eta * torch.sqrt(
+                    ((1.0 - alpha_bar_previous) / (1.0 - alpha_bar))
+                    * (1.0 - alpha_bar / alpha_bar_previous).clamp_min(0.0)
+                )
+                direction_scale = (1.0 - alpha_bar_previous - sigma.square()).clamp_min(
+                    0.0
+                ).sqrt()
+                if eta > 0.0:
+                    random_noise = torch.randn(
+                        sample.shape,
+                        device=sample.device,
+                        dtype=sample.dtype,
+                        generator=generator,
+                    )
+                else:
+                    random_noise = torch.zeros_like(sample)
+                sample = (
+                    alpha_bar_previous.sqrt() * clean
+                    + direction_scale * reconstructed_noise
+                    + sigma * random_noise
+                )
+            if trace_callback is not None:
+                assert trace is not None
+                trace["clean_for_update"] = clean.detach().clone()
+                trace["updated_sample"] = sample.detach().clone()
+                with torch.no_grad():
+                    trace_callback(trace)
         return sample
 
     @staticmethod

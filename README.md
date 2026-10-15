@@ -20,6 +20,10 @@ Tucker 缓存，新批次独立记录；不会自动取消或去重另一集群�
 
 已完成模型可先运行 [GH200 全测试集评估与组会图片](docs/gh200-evaluation.md)，按 90 分钟时限提交、逐案例续跑并生成 PNG/PDF 和指标报告。
 
+重建质量异常时，可运行 [GH200 逐步采样诊断](docs/sampling-diagnosis.md)：读取现有
+DiT3D/Tensor-DiT 权重，在少量验证案例上比较轨迹条件、CFG 与采样随机性，记录每步
+数值及 Tucker 解码幅度，不重新训练。已有 [模型代码审计记录](docs/model-code-audit-2026-10-14.md)。
+
 在 HPC 首次克隆整个仓库后，从 `project/` 运行工作流模板：
 
 ```bash
